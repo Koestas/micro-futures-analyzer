@@ -22,6 +22,7 @@ from routes.learn import router as learn_router
 from routes.backtest import router as backtest_router
 from routes.projectx import router as projectx_router
 from routes.autotrader import router as autotrader_router
+from routes.botstats import router as botstats_router
 
 
 async def _background_refresh():
@@ -69,10 +70,21 @@ async def lifespan(app: FastAPI):
     import providers.projectx as px
     px_task = asyncio.create_task(px.background_task())
 
+    # Auto-start the bot after ProjectX has time to authenticate
+    import engines.auto_trader as at
+    async def _delayed_bot_start():
+        await asyncio.sleep(20)   # wait for ProjectX auth + contract cache
+        await at.start()
+        import logging
+        logging.getLogger(__name__).info("Auto-trader started automatically")
+    bot_task = asyncio.create_task(_delayed_bot_start())
+
     yield
     yahoo_task.cancel()
     keepalive_task.cancel()
     px_task.cancel()
+    bot_task.cancel()
+    await at.stop()
     if px._ws_market:
         try:
             px._ws_market.stop()
@@ -103,6 +115,7 @@ app.include_router(learn_router)
 app.include_router(backtest_router)
 app.include_router(projectx_router)
 app.include_router(autotrader_router)
+app.include_router(botstats_router)
 
 
 @app.exception_handler(Exception)

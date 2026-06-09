@@ -23,6 +23,7 @@ from typing import Optional
 import pytz
 
 import providers.projectx as px
+import providers.telegram as tg
 from engines.ict import get_ict_analysis, get_htf_bias
 from engines.ict_signals import _INSTRUMENT_CONFIG
 from routes.backtest import (
@@ -221,6 +222,41 @@ def _vol_ok(bars: list, pct_limit: float) -> bool:
     return True
 
 
+# ─── News filter ─────────────────────────────────────────────────────────────
+
+def _news_clear(session_name: str) -> tuple[bool, str, int]:
+    """
+    Returns (clear, event_name, minutes_away).
+    Blocks trading if a High-impact USD event is within 30 minutes
+    or within 5 minutes after (let dust settle).
+    """
+    try:
+        from providers.calendar import get_calendar
+        cal = get_calendar()
+        events = cal.get("events", [])
+        now_et = datetime.now(NY_TZ)
+        for ev in events:
+            if ev.get("impact") != "High":
+                continue
+            currencies = ev.get("currencies", ev.get("currency", ""))
+            if "USD" not in str(currencies):
+                continue
+            ev_time_str = ev.get("time", "")
+            ev_date_str = ev.get("date", str(now_et.date()))
+            try:
+                ev_dt = NY_TZ.localize(datetime.strptime(
+                    f"{ev_date_str} {ev_time_str}", "%Y-%m-%d %I:%M%p"
+                ))
+            except Exception:
+                continue
+            diff_mins = (ev_dt - now_et).total_seconds() / 60
+            if -5 <= diff_mins <= 30:   # 30 min before → 5 min after
+                return False, ev.get("event", "High-impact event"), int(diff_mins)
+    except Exception:
+        pass
+    return True, "", 0
+
+
 # ─── P&L sync ─────────────────────────────────────────────────────────────────
 
 async def _sync_pnl():
@@ -375,8 +411,12 @@ async def _monitor_positions():
             positions = await px.get_positions()
             if not positions:
                 _log(f"Position closed — trade complete")
+                trade_sym = _active_trade.get("symbol", sym)
+                trade_dir = _active_trade.get("direction", "bullish")
+                trade_sess = _active_trade.get("session", "")
                 _active_trade = {}
                 await _sync_pnl()
+                asyncio.create_task(tg.alert_trade_closed(trade_sym, trade_dir, 0, _daily_pnl, trade_sess))
                 continue
 
             pos = next((p for p in positions if sym in (p.get("symbol", ""), p.get("contractId", ""))), None)
@@ -409,7 +449,9 @@ async def _monitor_positions():
                     if data.get("success"):
                         _active_trade["remaining_contracts"] = rem_ct - close_ct
                         _active_trade["partial_done"] = True
-                        _log(f"Partial close OK — {rem_ct - close_ct} runners left")
+                        runners = rem_ct - close_ct
+                        _log(f"Partial close OK — {runners} runners left")
+                        asyncio.create_task(tg.alert_partial_close(sym, close_ct, runners, _daily_pnl + float_pnl * PARTIAL_RATIO))
                     else:
                         _log(f"Partial close failed: {data.get('errorMessage')}", "error")
 
@@ -423,6 +465,8 @@ async def _monitor_positions():
                 _trail_locked_pnl = DAILY_TARGET
                 _trail_floor      = DAILY_TARGET
                 _log(f"Trail mode activated — P&L ${total_pnl:.0f} >= target ${DAILY_TARGET:.0f} ✓", "warning")
+                asyncio.create_task(tg.alert_trail_activated(total_pnl, DAILY_TARGET))
+                asyncio.create_task(tg.alert_daily_target(total_pnl))
 
             # ── Trail stop management ─────────────────────────────────────
             if _trail_mode and _active_trade.get("stop_order_id"):
@@ -450,6 +494,7 @@ async def _monitor_positions():
                         _trail_floor = new_floor
                         _active_trade["stop_price"] = new_stop_price
                         _log(f"Stop trailed → {new_stop_price:.2f} | floor ${new_floor:.0f} locked", "warning")
+                        asyncio.create_task(tg.alert_stop_trailed(sym, new_stop_price, new_floor))
 
         except Exception as e:
             _log(f"Monitor error: {e}", "error")
@@ -462,6 +507,7 @@ async def _loop():
     global _daily_pnl, _trades_today, _trail_mode, _trail_floor
 
     _log("Auto-trader started ✓  |  Target $800/day  |  22-hr coverage")
+    asyncio.create_task(tg.alert_bot_started())
 
     while _running:
         try:
@@ -488,6 +534,7 @@ async def _loop():
             if _daily_pnl <= -DAILY_MAX_LOSS:
                 _current_session_name = "HALTED — daily loss limit"
                 _log(f"Daily loss ${abs(_daily_pnl):.0f} hit ${DAILY_MAX_LOSS:.0f} limit — halted for day", "error")
+                asyncio.create_task(tg.alert_daily_halt(_daily_pnl, DAILY_MAX_LOSS))
                 await asyncio.sleep(600)
                 continue
 
@@ -513,6 +560,14 @@ async def _loop():
             positions = await px.get_positions()
             if positions:
                 await asyncio.sleep(45)
+                continue
+
+            # News filter — skip if high-impact USD event within 30 min
+            news_clear, news_event, news_mins = _news_clear(session["name"])
+            if not news_clear:
+                _log(f"NEWS BLOCK: {news_event} in {news_mins}min — skipping scan", "warning")
+                asyncio.create_task(tg.alert_news_block(news_event, news_mins, session["name"]))
+                await asyncio.sleep(300)
                 continue
 
             # Scan instruments
@@ -578,6 +633,27 @@ async def _loop():
             if result.get("success"):
                 order_id = result.get("orderId")
                 _log(f"ORDER PLACED — ID {order_id}", "warning")
+                asyncio.create_task(tg.alert_trade_opened(setup))
+
+                # Mirror to additional accounts if configured
+                mirror_ids = px.get_mirror_account_ids()
+                for mirror_id in mirror_ids:
+                    try:
+                        mr = await px.place_order(
+                            symbol=setup["instrument"],
+                            side=setup["side"],
+                            size=setup["contracts"],
+                            order_type=2,
+                            stop_loss_ticks=setup["stop_ticks"],
+                            take_profit_ticks=setup["stop_ticks"] * 2,
+                            account_id=mirror_id,
+                        )
+                        if mr.get("success"):
+                            _log(f"Mirror account {mirror_id}: order {mr.get('orderId')} placed")
+                        else:
+                            _log(f"Mirror account {mirror_id}: {mr.get('errorMessage')}", "error")
+                    except Exception as e:
+                        _log(f"Mirror account {mirror_id} error: {e}", "error")
 
                 # Wait briefly then find the stop bracket order ID
                 await asyncio.sleep(3)
@@ -620,6 +696,7 @@ async def _loop():
             await asyncio.sleep(30)
 
     _log("Auto-trader stopped")
+    asyncio.create_task(tg.alert_bot_stopped())
 
 
 # ─── Start / Stop ─────────────────────────────────────────────────────────────

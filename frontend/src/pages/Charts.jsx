@@ -4,9 +4,9 @@ import { createChart, CrosshairMode, LineStyle } from 'lightweight-charts'
 import { apiFetch, fmt } from '../lib/api'
 
 const SYMBOLS = [
-  { symbol: 'NQ=F', label: 'MNQ', ictSymbol: 'NQ=F' },
-  { symbol: 'ES=F', label: 'MES', ictSymbol: 'ES=F' },
-  { symbol: 'GC=F', label: 'MGC', ictSymbol: 'GC=F' },
+  { symbol: 'NQ=F', label: 'MNQ', ictSymbol: 'NQ=F', pxSymbol: 'MNQ' },
+  { symbol: 'ES=F', label: 'MES', ictSymbol: 'ES=F', pxSymbol: 'MES' },
+  { symbol: 'GC=F', label: 'MGC', ictSymbol: 'GC=F', pxSymbol: 'MGC' },
 ]
 
 const INTERVAL_PERIODS = {
@@ -43,8 +43,9 @@ export default function Charts() {
   const [overlays, setOverlays] = useState(DEFAULT_OVERLAYS)
   const [volColor, setVolColor] = useState(false)
   const [showSma200, setShowSma200] = useState(false)
+  const [useLive, setUseLive] = useState(true)   // true = ProjectX live, false = Yahoo
 
-  const { symbol, ictSymbol } = SYMBOLS[symbolIndex]
+  const { symbol, ictSymbol, pxSymbol } = SYMBOLS[symbolIndex]
 
   const chartContainerRef = useRef(null)
   const chartRef      = useRef(null)
@@ -64,12 +65,42 @@ export default function Charts() {
   const validPeriods = INTERVAL_PERIODS[interval]?.periods || []
   const isIntraday   = ['1m', '5m', '15m', '30m', '1h'].includes(interval)
 
-  const { data, isLoading, isFetching } = useQuery({
+  // Live (ProjectX) bars — real-time, no delay
+  const pxLimitMap = { '1m': 300, '5m': 500, '15m': 400, '30m': 300, '1h': 500, '1d': 90 }
+  const pxLimit = pxLimitMap[interval] || 300
+  const { data: pxData, isLoading: pxLoading } = useQuery({
+    queryKey: ['chart-px', pxSymbol, interval],
+    queryFn: () => fetch(`/api/projectx/bars?symbol=${pxSymbol}&interval=${interval}&limit=${pxLimit}`)
+      .then(r => r.json())
+      .then(d => ({
+        // Normalize to same shape as Yahoo chart endpoint
+        bars: (d.bars || []).map(b => ({
+          time:   b.time,
+          open:   b.open,
+          high:   b.high,
+          low:    b.low,
+          close:  b.close,
+          volume: b.volume,
+        })),
+        symbol: pxSymbol,
+        source: 'projectx',
+      })),
+    refetchInterval: 30_000,   // refresh every 30s — near real-time
+    staleTime: 15_000,
+    enabled: useLive,
+  })
+
+  // Yahoo Finance fallback
+  const { data: yahooData, isLoading: yahooLoading, isFetching } = useQuery({
     queryKey: ['chart', symbol, interval, period],
     queryFn: () => apiFetch(`/api/market/chart?symbol=${symbol}&interval=${interval}&period=${period}`),
     refetchInterval: 60_000,
     staleTime: 30_000,
+    enabled: !useLive,
   })
+
+  const data = useLive ? pxData : yahooData
+  const isLoading = useLive ? pxLoading : yahooLoading
 
   const { data: ictData } = useQuery({
     queryKey: ['chart-ict', ictSymbol],
@@ -424,9 +455,24 @@ export default function Charts() {
           ))}
         </div>
 
+        <div className="w-px h-5 bg-terminal-border" />
+
+        {/* Live / Yahoo toggle */}
+        <button
+          onClick={() => setUseLive(v => !v)}
+          className={`px-3 py-1 rounded text-xs font-bold border transition-colors ${
+            useLive
+              ? 'bg-green-900 border-green-600 text-green-400'
+              : 'bg-terminal-card border-terminal-border text-gray-500'
+          }`}
+        >
+          {useLive ? '● LIVE' : '○ Yahoo'}
+        </button>
+
         <div className="ml-auto flex items-center gap-2 text-xs text-terminal-muted">
-          {isFetching && <span className="animate-pulse text-terminal-yellow">updating...</span>}
-          {data?.bar_count != null && <span>{data.bar_count} bars</span>}
+          {isLoading && <span className="animate-pulse text-terminal-yellow">loading...</span>}
+          {data?.bars?.length != null && <span>{data.bars.length} bars</span>}
+          {data?.source === 'projectx' && <span className="text-green-500">ProjectX</span>}
         </div>
       </div>
 

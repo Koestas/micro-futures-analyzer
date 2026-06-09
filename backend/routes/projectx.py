@@ -104,6 +104,50 @@ async def contracts(search: str = "MNQ"):
     return {"contracts": results}
 
 
+@router.get("/ict")
+async def live_ict(symbol: str = "MNQ", interval: str = "5m"):
+    """
+    Run full ICT analysis on live ProjectX bars.
+    Same response shape as /api/ict/analysis — drop-in replacement with real futures data.
+    """
+    from engines.ict import get_ict_analysis, extract_session_levels, detect_equal_highs_lows
+    from engines.ict_signals import get_advanced_signals
+    from datetime import timezone as tz
+
+    bar_data = await px.get_bars(symbol.upper(), interval=interval, limit=300)
+    if not bar_data:
+        raise HTTPException(503, f"No bars available for {symbol}")
+
+    # Sort ascending
+    if bar_data and bar_data[0]["time"] > bar_data[-1]["time"]:
+        bar_data = list(reversed(bar_data))
+
+    price = bar_data[-1]["close"] if bar_data else 0
+    now   = datetime.now(tz.utc)
+
+    analysis    = get_ict_analysis(bar_data, current_price=price)
+    sess_levels = extract_session_levels(bar_data)
+    ehl         = detect_equal_highs_lows(bar_data)
+    adv         = get_advanced_signals(bar_data, session_levels=sess_levels, equal_hl=ehl)
+
+    quote = px.get_quote(symbol.upper())
+
+    result = dict(analysis)   # base: ICT analysis
+    result.update({
+        "symbol":         symbol.upper(),
+        "price":          price,
+        "bid":            quote.get("bestBid")  if quote else None,
+        "ask":            quote.get("bestAsk")  if quote else None,
+        "source":         "projectx_live",
+        "timestamp":      now.isoformat(),
+        "bars_count":     len(bar_data),
+        "session_levels": sess_levels,
+        "equal_hl":       ehl,
+        "advanced":       adv,
+    })
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Account
 # ---------------------------------------------------------------------------

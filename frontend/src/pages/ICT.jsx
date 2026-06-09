@@ -963,14 +963,31 @@ export default function ICT() {
   const [tradeBalance, setTradeBalance] = useState('25000')
   const [tradePrevClose, setTradePrevClose] = useState('')
   const [tradeKey, setTradeKey] = useState(0)
+  const [useLive, setUseLive] = useState(true)  // true = ProjectX live data
   const sym = SYMBOLS[symbolIdx]
 
-  const { data, isLoading, refetch, dataUpdatedAt } = useQuery({
+  // Live ICT — runs on real ProjectX MNQ/MES/MGC bars (no Yahoo delay)
+  const { data: liveData, isLoading: liveLoading, refetch: liveRefetch, dataUpdatedAt: liveUpdatedAt } = useQuery({
+    queryKey: ['ict-live', sym.instrument],
+    queryFn: () => fetch(`/api/projectx/ict?symbol=${sym.instrument}&interval=5m`).then(r => r.json()),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+    enabled: useLive,
+  })
+
+  // Yahoo Finance fallback
+  const { data: yahooData, isLoading: yahooLoading, refetch: yahooRefetch, dataUpdatedAt: yahooUpdatedAt } = useQuery({
     queryKey: ['ict-analysis', sym.value],
     queryFn: () => apiFetch(`/api/ict/analysis?symbol=${sym.value}`),
     refetchInterval: 60_000,
     staleTime: 30_000,
+    enabled: !useLive,
   })
+
+  const data        = useLive ? liveData    : yahooData
+  const isLoading   = useLive ? liveLoading : yahooLoading
+  const refetch     = useLive ? liveRefetch : yahooRefetch
+  const dataUpdatedAt = useLive ? liveUpdatedAt : yahooUpdatedAt
 
   const { data: adv, isLoading: advLoading } = useQuery({
     queryKey: ['ict-advanced', sym.value, sym.secondary],
@@ -1065,6 +1082,12 @@ export default function ICT() {
             ))}
           </div>
           {dataUpdatedAt && <span className="text-xs text-terminal-muted">{fmt.timeAgo(new Date(dataUpdatedAt).toISOString())}</span>}
+          <button
+            onClick={() => setUseLive(v => !v)}
+            className={`px-2 py-0.5 rounded text-xs font-bold border ${useLive ? 'bg-green-900 border-green-600 text-green-400' : 'bg-terminal-card border-terminal-border text-gray-500'}`}
+          >
+            {useLive ? '● LIVE' : '○ Yahoo'}
+          </button>
           <button onClick={() => refetch()} className="flex items-center gap-1 text-xs text-terminal-blue hover:underline">
             <RefreshCw size={11}/> Refresh
           </button>

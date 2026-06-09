@@ -75,6 +75,27 @@ def is_connected() -> bool:
     )
 
 
+def get_mirror_account_ids() -> list[int]:
+    """
+    Returns all account IDs to mirror trades to (from PROJECTX_MIRROR_ACCOUNTS env var).
+    Format: comma-separated IDs, e.g. "23115763,23413210"
+    Primary account (PROJECTX_ACCOUNT_ID) is always excluded — it places first.
+    """
+    raw = os.getenv("PROJECTX_MIRROR_ACCOUNTS", "")
+    if not raw:
+        return []
+    primary = _account_id
+    ids = []
+    for part in raw.split(","):
+        try:
+            aid = int(part.strip())
+            if aid != primary:
+                ids.append(aid)
+        except ValueError:
+            pass
+    return ids
+
+
 # ---------------------------------------------------------------------------
 # Accounts
 # ---------------------------------------------------------------------------
