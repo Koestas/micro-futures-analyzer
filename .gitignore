@@ -1,6 +1,6 @@
-# Session logs — private, local only
-chat_logs/
-chat-logs/
+# Session logs — raw JSONL private, but .md summaries are committed
+chat_logs/*.jsonl
+chat-logs/*.jsonl
 
 # Environment / secrets
 .env
