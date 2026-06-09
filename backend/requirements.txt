@@ -8,3 +8,4 @@ pandas==2.2.2
 numpy==1.26.4
 python-multipart==0.0.9
 pytz==2024.1
+signalrcore==0.9.5

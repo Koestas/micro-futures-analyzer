@@ -20,11 +20,11 @@ from routes.ict import router as ict_router
 from routes.risk import router as risk_router
 from routes.learn import router as learn_router
 from routes.backtest import router as backtest_router
+from routes.projectx import router as projectx_router
 
 
 async def _background_refresh():
-    """Proactively warm the data cache every 5 minutes.
-    Runs regardless of whether any browser tab is open."""
+    """Proactively warm the Yahoo Finance + ProjectX data cache."""
     import providers.yahoo as yf
     from providers.calendar import get_calendar
 
@@ -44,9 +44,20 @@ async def _background_refresh():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    task = asyncio.create_task(_background_refresh())
+    yahoo_task = asyncio.create_task(_background_refresh())
+
+    # ProjectX live data (non-blocking — logs warning if creds missing)
+    import providers.projectx as px
+    px_task = asyncio.create_task(px.background_task())
+
     yield
-    task.cancel()
+    yahoo_task.cancel()
+    px_task.cancel()
+    if px._ws_market:
+        try:
+            px._ws_market.stop()
+        except Exception:
+            pass
 
 
 app = FastAPI(title="Micro Futures Analyzer", version="1.0.0", lifespan=lifespan)
@@ -70,6 +81,7 @@ app.include_router(ict_router)
 app.include_router(risk_router)
 app.include_router(learn_router)
 app.include_router(backtest_router)
+app.include_router(projectx_router)
 
 
 @app.exception_handler(Exception)
