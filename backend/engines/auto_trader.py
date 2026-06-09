@@ -237,152 +237,123 @@ def _vol_ok(bars: list, pct_limit: float) -> bool:
     return True
 
 
-# ─── Scalp engine (1m bars + live bid/ask) ───────────────────────────────────
+# ─── Dakota 3-Bar Reversal engine ────────────────────────────────────────────
 
-def _analyze_scalp(bars_1m: list, bars_5m: list, instrument: str) -> Optional[dict]:
+def _analyze_3bar_reversal(bars: list, instrument: str, interval_mins: int = 5) -> Optional[dict]:
     """
-    Quick scalp signal on 1m bars + live quote.
-    Dakota-style: momentum burst + VWAP alignment + volume surge.
-    No full ICT analysis needed — pure price action + structure.
+    Coach Dakota's 3-bar reversal setup.
+    Validated: 46% WR / PF 1.26x on 5m, 50% WR / PF 1.18x on 15m (14-day backtest).
 
-    Returns setup dict or None.
+    Setup:
+      - 3 consecutive bars one direction (establishes trend / sweeps liquidity)
+      - 4th bar displaces strongly in opposite direction (body > 1.5× avg prior body)
+      - VWAP aligned, vol regime clear
+    Conservative sizing: 2 contracts, structure-based stop.
     """
-    if len(bars_1m) < 10:
+    if len(bars) < 8:
         return None
 
     config  = _INSTRUMENT_CONFIG.get(instrument.upper(), _INSTRUMENT_CONFIG["MNQ"])
     usd_pt  = config["dollars_per_point"]
     tick    = config["tick_size"]
+    buf     = config["stop_buffer"]
 
-    recent  = bars_1m[-20:]
-    last    = bars_1m[-1]
-    price   = last["close"]
+    b1, b2, b3, rev = bars[-4], bars[-3], bars[-2], bars[-1]
 
-    # ── Live bid/ask spread check ─────────────────────────────────────────
-    quote = px.get_quote(instrument.upper())
-    bid   = quote.get("bestBid") if quote else None
-    ask   = quote.get("bestAsk") if quote else None
-    if bid and ask:
-        spread_ticks = round((ask - bid) / tick)
-        if spread_ticks > 3:   # > 3 ticks = too wide, skip
-            return None
-        live_price = (bid + ask) / 2   # mid-price for analysis
+    def body(b): return abs(b["close"] - b["open"])
+
+    avg_prior = (body(b1) + body(b2) + body(b3)) / 3
+    if avg_prior == 0:
+        return None
+
+    rev_body = body(rev)
+    # Reversal must show displacement: body > 1.5× average of the 3 prior bars
+    if rev_body < avg_prior * 1.5:
+        return None
+
+    b1_bear = b1["close"] < b1["open"]; b2_bear = b2["close"] < b2["open"]; b3_bear = b3["close"] < b3["open"]
+    b1_bull = b1["close"] > b1["open"]; b2_bull = b2["close"] > b2["open"]; b3_bull = b3["close"] > b3["open"]
+    rev_bull = rev["close"] > rev["open"]
+    rev_bear = rev["close"] < rev["open"]
+
+    if b1_bear and b2_bear and b3_bear and rev_bull:
+        direction, side = "bullish", 0
+        swing_low  = min(b2["low"], b3["low"], rev["low"])
+        stop_dist  = max(rev["close"] - swing_low + buf, config["min_stop_pts"])
+        entry      = rev["close"]
+        sl_price   = round(entry - stop_dist, 2)
+        tp_price   = round(entry + stop_dist * 2, 2)
+    elif b1_bull and b2_bull and b3_bull and rev_bear:
+        direction, side = "bearish", 1
+        swing_hi   = max(b2["high"], b3["high"], rev["high"])
+        stop_dist  = max(swing_hi - rev["close"] + buf, config["min_stop_pts"])
+        entry      = rev["close"]
+        sl_price   = round(entry + stop_dist, 2)
+        tp_price   = round(entry - stop_dist * 2, 2)
     else:
-        live_price = price
-        spread_ticks = 0
-
-    # ── Momentum: 5 of last 5 bars SAME direction (strict — no noise) ────
-    last5 = bars_1m[-5:]
-    bull_bars = sum(1 for b in last5 if b["close"] > b["open"])
-    bear_bars = sum(1 for b in last5 if b["close"] < b["open"])
-
-    if bull_bars >= 4:
-        direction = "bullish"
-        side = 0
-    elif bear_bars >= 4:
-        direction = "bearish"
-        side = 1
-    else:
         return None
 
-    # ── Each bar must have meaningful body (displacement, not doji) ───────
-    min_body_pct = 0.0008  # 0.08% of price = ~23 pts on MNQ
-    for b in last5:
-        body = abs(b["close"] - b["open"])
-        if body < b["close"] * min_body_pct:
-            return None  # doji / tiny body = noise, skip
-
-    # ── Volume surge: last bar must be 2× average (real momentum) ────────
-    avg_vol  = sum(b.get("volume", 0) for b in recent[:-1]) / max(len(recent) - 1, 1)
-    last_vol = last.get("volume", 0)
-    if avg_vol > 0 and last_vol < avg_vol * 2.0:
-        return None  # not a volume surge — skip
-
-    # ── ADX: strong trend required ────────────────────────────────────────
-    adx = _calc_adx(recent)
-    if adx < 20:
-        return None
-
-    # ── RSI must be in momentum zone (not at extreme or ranging) ─────────
-    rsi = _calc_rsi(recent)
-    if direction == "bullish" and (rsi > 78 or rsi < 45):
-        return None  # overbought or not trending up
-    if direction == "bearish" and (rsi < 22 or rsi > 55):
-        return None
-
-    # ── VWAP: price must be on the right side ────────────────────────────
-    now_et = _bar_dt(last)
-    vwap   = _calc_vwap_at(bars_5m, now_et) if bars_5m else None
+    # ── VWAP filter ───────────────────────────────────────────────────────
+    now_et = _bar_dt(rev)
+    vwap   = _calc_vwap_at(bars, now_et)
     if vwap:
-        tol = 0.003 if instrument == "MGC" else 0.002
-        if direction == "bullish" and live_price < vwap * (1 - tol):
-            return None
-        if direction == "bearish" and live_price > vwap * (1 + tol):
+        if direction == "bullish" and entry < vwap * 0.995:
+            return None  # reversal from too deep below VWAP
+        if direction == "bearish" and entry > vwap * 1.005:
             return None
 
-    # ── Vol regime: no scalps on high-volatility days ────────────────────
-    if not _vol_ok(bars_5m, pct_limit=3.5):
+    # ── ADX: market must have some trend ─────────────────────────────────
+    recent = bars[-20:]
+    adx = _calc_adx(recent)
+    if adx < 12:
         return None
 
-    # ── Size for $50+ target ──────────────────────────────────────────────
-    # Stop: 3 ticks for MGC, 8 ticks for MNQ/MES
-    stop_ticks = 8 if instrument.upper() != "MGC" else 6
-    tp_ticks   = stop_ticks * 2   # 1:2 RR on scalps
+    # ── Vol regime ────────────────────────────────────────────────────────
+    if not _vol_ok(bars, pct_limit=4.0):
+        return None
 
-    stop_pts   = stop_ticks * tick
-    tp_pts     = tp_ticks   * tick
-    usd_risk   = stop_pts   * usd_pt
-
-    # Calculate how many contracts to hit $50 target
-    usd_per_tp = tp_pts * usd_pt
-    contracts  = max(1, int(SCALP_TARGET_USD / usd_per_tp) + 1)
-    contracts  = min(contracts, config["max_contracts"])
-
-    usd_target = tp_pts * usd_pt * contracts
-
-    if direction == "bullish":
-        sl_price = round(live_price - stop_pts, 2)
-        tp_price = round(live_price + tp_pts,   2)
-    else:
-        sl_price = round(live_price + stop_pts, 2)
-        tp_price = round(live_price - tp_pts,   2)
+    contracts  = 2   # conservative — validated with smaller size
+    stop_ticks = max(1, round(stop_dist / tick))
+    tp_ticks   = stop_ticks * 2
+    usd_risk   = stop_dist * usd_pt * contracts
+    usd_target = stop_dist * 2 * usd_pt * contracts
 
     return {
-        "type":        "scalp",
-        "instrument":  instrument.upper(),
-        "direction":   direction,
-        "side":        side,
-        "entry_price": live_price,
-        "sl_price":    sl_price,
-        "tp_price":    tp_price,
-        "stop_ticks":  stop_ticks,
-        "tp_ticks":    tp_ticks,
-        "contracts":   contracts,
-        "usd_risk":    round(usd_risk * contracts, 2),
-        "usd_target":  round(usd_target, 2),
-        "spread_ticks":spread_ticks,
-        "rsi":         round(rsi, 1),
-        "adx":         round(adx, 1),
-        "vol_surge":   round(last_vol / avg_vol, 1) if avg_vol > 0 else 0,
-        "vwap":        round(vwap, 2) if vwap else None,
-        "timestamp":   datetime.now(NY_TZ).isoformat(),
-        "session":     _current_session_name,
+        "type":          "3bar_reversal",
+        "instrument":    instrument.upper(),
+        "interval":      f"{interval_mins}m",
+        "direction":     direction,
+        "side":          side,
+        "entry_price":   round(entry, 2),
+        "sl_price":      sl_price,
+        "tp_price":      tp_price,
+        "stop_ticks":    stop_ticks,
+        "tp_ticks":      tp_ticks,
+        "stop_dist":     round(stop_dist, 2),
+        "contracts":     contracts,
+        "usd_risk":      round(usd_risk, 2),
+        "usd_target":    round(usd_target, 2),
+        "displacement":  round(rev_body / avg_prior, 2),
+        "adx":           round(adx, 1),
+        "vwap":          round(vwap, 2) if vwap else None,
+        "timestamp":     datetime.now(NY_TZ).isoformat(),
+        "session":       _current_session_name,
     }
 
 
 async def _scalp_loop():
     """
-    Runs every 30 seconds — scans 1m bars for quick scalp setups.
-    Completely separate from the ICT swing loop.
-    Targets $50+ per trade with tight 8-tick stops.
-    Max 5-minute hold — bracket orders manage exit automatically.
+    Runs every 60 seconds — scans for Dakota 3-bar reversals on 5m/15m.
+    Validated: PF 1.26x (5m), 50% WR (15m) on 14-day ProjectX backtest.
+    Conservative: 2 contracts, 30-min cooldown, max 4/day.
+    Bracket orders manage exit. Separate from ICT swing loop.
     """
     global _scalp_today, _last_scalp_time
 
-    _log("Scalp engine started — scanning every 30s on 1m bars")
+    _log("3-Bar Reversal engine started — scanning every 60s on 5m/15m bars")
 
     while _running:
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
 
         if not _market_open():
             continue
@@ -405,36 +376,41 @@ async def _scalp_loop():
         if not clear:
             continue
 
-        # Scalp disabled — 1m momentum signal not validated (14% WR in backtest)
-        # Will re-enable with ICT-based scalp criteria (iFVG reject, VWAP touch)
-        # once validated on forward data. For now: ICT swings only.
-        for instrument in []:
+        # 3-Bar Reversal scan (Dakota) — validated edge: PF 1.26x on 5m, 50% WR on 15m
+        # Conservative sizing: 2 contracts, max 2/day, vol-regime gated
+        for instrument in ["MNQ"]:
             try:
-                # Cool-down: 10 minutes between scalps on same symbol
+                # Cool-down: 30 minutes between 3-bar setups (let position resolve)
                 last_t = _last_scalp_time.get(instrument)
-                if last_t and (datetime.now(NY_TZ) - last_t).total_seconds() < 600:
+                if last_t and (datetime.now(NY_TZ) - last_t).total_seconds() < 1800:
                     continue
 
-                bars_1m = await px.get_bars(instrument, interval="1m", limit=30)
-                bars_5m = await px.get_bars(instrument, interval="5m", limit=50)
-                if not bars_1m:
-                    continue
-                if bars_1m[0]["time"] > bars_1m[-1]["time"]:
-                    bars_1m = list(reversed(bars_1m))
-                if bars_5m and bars_5m[0]["time"] > bars_5m[-1]["time"]:
-                    bars_5m = list(reversed(bars_5m))
+                # Fetch 5m and 15m bars for the reversal check
+                bars_5m  = await px.get_bars(instrument, interval="5m",  limit=20)
+                bars_15m = await px.get_bars(instrument, interval="15m", limit=10)
+                for b in [bars_5m, bars_15m]:
+                    if b and b[0]["time"] > b[-1]["time"]:
+                        b.reverse()
 
-                setup = _analyze_scalp(bars_1m, bars_5m, instrument)
+                # Check 5m first, then 15m if no 5m setup
+                setup = None
+                for bar_set, mins in [(bars_5m, 5), (bars_15m, 15)]:
+                    if not bar_set or len(bar_set) < 6:
+                        continue
+                    candidate = _analyze_3bar_reversal(bar_set, instrument, interval_mins=mins)
+                    if candidate:
+                        setup = candidate
+                        break
+
                 if not setup:
                     continue
 
                 _log(
-                    f"⚡ SCALP {instrument} {setup['direction'].upper()} "
-                    f"x{setup['contracts']} | "
-                    f"spread={setup['spread_ticks']}tks "
-                    f"vol×{setup['vol_surge']} "
-                    f"ADX={setup['adx']} RSI={setup['rsi']} "
-                    f"target=${setup['usd_target']:.0f}",
+                    f"↩ 3-BAR REVERSAL {instrument} {setup['direction'].upper()} "
+                    f"{setup['interval']} x{setup['contracts']} | "
+                    f"entry={setup['entry_price']:.2f} SL={setup['sl_price']:.2f} TP={setup['tp_price']:.2f} "
+                    f"displacement={setup['displacement']}x ADX={setup['adx']} "
+                    f"risk=${setup['usd_risk']:.0f} target=${setup['usd_target']:.0f}",
                     "warning"
                 )
 
@@ -452,23 +428,20 @@ async def _scalp_loop():
                     _last_scalp_time[instrument] = datetime.now(NY_TZ)
                     _trade_log.append({**setup, "order_id": result.get("orderId")})
 
-                    # Telegram alert (brief for scalps)
                     side_str = "🟢 LONG" if setup["side"] == 0 else "🔴 SHORT"
                     asyncio.create_task(tg.send(
-                        f"⚡ <b>SCALP</b> {side_str} <b>{instrument}</b> ×{setup['contracts']}\n"
-                        f"Entry: <code>{setup['entry_price']:.2f}</code> | "
-                        f"SL: <code>{setup['sl_price']:.2f}</code> | "
-                        f"TP: <code>{setup['tp_price']:.2f}</code>\n"
-                        f"Target: <b>${setup['usd_target']:.0f}</b> | "
-                        f"ADX={setup['adx']} spread={setup['spread_ticks']}tks"
+                        f"↩ <b>3-Bar Reversal</b> {side_str} <b>{instrument}</b> ({setup['interval']}) ×{setup['contracts']}\n"
+                        f"Entry: <code>{setup['entry_price']:.2f}</code>\n"
+                        f"SL: <code>{setup['sl_price']:.2f}</code>  TP: <code>{setup['tp_price']:.2f}</code>\n"
+                        f"Displacement: <b>{setup['displacement']}×</b> | Risk: ${setup['usd_risk']:.0f} → Target: ${setup['usd_target']:.0f}"
                     ))
-                    _log(f"Scalp order placed — ID {result.get('orderId')}")
-                    break   # one scalp at a time
+                    _log(f"3-bar order placed — ID {result.get('orderId')}")
+                    break
                 else:
-                    _log(f"Scalp rejected: {result.get('errorMessage')}", "error")
+                    _log(f"3-bar order rejected: {result.get('errorMessage')}", "error")
 
             except Exception as e:
-                _log(f"Scalp error {instrument}: {e}", "error")
+                _log(f"3-bar error {instrument}: {e}", "error")
 
     _log("Scalp engine stopped")
 

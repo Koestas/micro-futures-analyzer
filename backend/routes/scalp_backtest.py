@@ -181,6 +181,131 @@ def _sim_scalp(bars_1m: list, instrument: str) -> dict:
     }
 
 
+# ── Dakota 3-Bar Reversal sim ────────────────────────────────────────────────
+
+def _sim_3bar_reversal(bars: list, instrument: str, interval_mins: int = 5) -> dict:
+    """
+    Coach Dakota's 3-bar reversal:
+      3 consecutive bars in one direction →
+      reversal bar displaces strongly opposite (body > 1.5× avg of prior 3)
+      Enter at close of reversal bar.
+      Stop: beyond the swing extreme of bars 2-3 + small buffer.
+      Target: 2R (2× the stop distance).
+    Works on 5m and 15m.
+    """
+    config   = _INSTRUMENT_CONFIG.get(instrument, _INSTRUMENT_CONFIG["MNQ"])
+    usd_pt   = config["dollars_per_point"]
+    tick     = config["tick_size"]
+    buf      = config["stop_buffer"]
+    trades   = []
+    cooldown = max(6, int(60 / interval_mins))   # 1-hour cooldown
+    last_entry_i = -cooldown
+    max_hold     = max(6, int(90 / interval_mins))  # 90-min max hold
+
+    for i in range(8, len(bars) - max_hold - 1):
+        if i - last_entry_i < cooldown:
+            continue
+
+        dt   = _to_dt(bars[i])
+        mins = dt.hour * 60 + dt.minute
+        # Skip market close window
+        if 16 * 60 <= mins < 18 * 60:
+            continue
+
+        b1, b2, b3, rev = bars[i-3], bars[i-2], bars[i-1], bars[i]
+
+        def body(b):
+            return abs(b["close"] - b["open"])
+
+        avg_prior_body = (body(b1) + body(b2) + body(b3)) / 3
+        if avg_prior_body == 0:
+            continue
+
+        rev_body = body(rev)
+        # Reversal must be a displacement bar (1.5× larger than the prior trend)
+        if rev_body < avg_prior_body * 1.5:
+            continue
+
+        b1_bear = b1["close"] < b1["open"]
+        b2_bear = b2["close"] < b2["open"]
+        b3_bear = b3["close"] < b3["open"]
+        rev_bull = rev["close"] > rev["open"]
+
+        b1_bull = b1["close"] > b1["open"]
+        b2_bull = b2["close"] > b2["open"]
+        b3_bull = b3["close"] > b3["open"]
+        rev_bear = rev["close"] < rev["open"]
+
+        if b1_bear and b2_bear and b3_bear and rev_bull:
+            direction = "bullish"
+            entry     = rev["close"]
+            swing_low = min(b2["low"], b3["low"], rev["low"])
+            stop      = swing_low - buf
+            stop_dist = max(entry - stop, config["min_stop_pts"])
+            stop      = entry - stop_dist
+            tp        = entry + stop_dist * 2
+            side      = 0
+        elif b1_bull and b2_bull and b3_bull and rev_bear:
+            direction = "bearish"
+            entry     = rev["close"]
+            swing_hi  = max(b2["high"], b3["high"], rev["high"])
+            stop      = swing_hi + buf
+            stop_dist = max(stop - entry, config["min_stop_pts"])
+            stop      = entry + stop_dist
+            tp        = entry - stop_dist * 2
+            side      = 1
+        else:
+            continue
+
+        # ── VWAP filter ───────────────────────────────────────────────────
+        day_bars = [b for b in bars if _to_dt(b).date() == dt.date()]
+        vwap = _calc_vwap_at(day_bars, dt) if day_bars else None
+        if vwap:
+            if direction == "bullish" and entry < vwap * 0.995:
+                continue
+            if direction == "bearish" and entry > vwap * 1.005:
+                continue
+
+        contracts = min(5, config["max_contracts"])
+
+        # ── Simulate exit ─────────────────────────────────────────────────
+        outcome    = "timeout"
+        exit_price = None
+        for j in range(1, max_hold + 1):
+            if i + j >= len(bars):
+                break
+            fut = bars[i + j]
+            if direction == "bullish":
+                if fut["low"]  <= stop: outcome, exit_price = "loss", stop; break
+                if fut["high"] >= tp:   outcome, exit_price = "win",  tp;   break
+            else:
+                if fut["high"] >= stop: outcome, exit_price = "loss", stop; break
+                if fut["low"]  <= tp:   outcome, exit_price = "win",  tp;   break
+
+        if exit_price is None:
+            exit_price = bars[min(i + max_hold, len(bars)-1)]["close"]
+
+        pnl = (
+            (exit_price - entry if direction == "bullish" else entry - exit_price)
+            * usd_pt * contracts
+        )
+        trades.append({
+            "date":      dt.strftime("%Y-%m-%d"),
+            "time_et":   dt.strftime("%H:%M"),
+            "direction": direction,
+            "entry":     round(entry, 2),
+            "exit":      round(exit_price, 2),
+            "outcome":   outcome,
+            "pnl":       round(pnl, 2),
+            "stop_dist": round(stop_dist, 2),
+            "rev_body":  round(rev_body, 2),
+            "displacement": round(rev_body / avg_prior_body, 2),
+        })
+        last_entry_i = i
+
+    return {"instrument": instrument, "interval": f"{interval_mins}m", "trades": trades}
+
+
 # ── ICT 5m sim ────────────────────────────────────────────────────────────────
 
 def _sim_ict(bars_5m: list, instrument: str) -> dict:
@@ -391,7 +516,20 @@ async def run_scalp_backtest(days: int = 14):
     bars_5m_mnq = _sort_asc(bars_5m_mnq)
     if bars_5m_mnq:
         raw = _sim_ict(bars_5m_mnq, "MNQ")
-        results["mnq_ict"] = _stats(raw["trades"], "MNQ ICT 5m Swings")
+        results["mnq_ict"] = _stats(raw["trades"], "MNQ ICT 5m Swings (simplified)")
+
+    # ── Dakota 3-Bar Reversal — 5m ──
+    if bars_5m_mnq:
+        raw = _sim_3bar_reversal(bars_5m_mnq, "MNQ", interval_mins=5)
+        results["mnq_3bar_5m"] = _stats(raw["trades"], "MNQ 3-Bar Reversal 5m")
+
+    # ── Dakota 3-Bar Reversal — 15m ──
+    bars_15m_mnq = await px.get_bars("MNQ", interval="15m", limit=2000,
+                                     start_time=start, end_time=end)
+    bars_15m_mnq = _sort_asc(bars_15m_mnq)
+    if bars_15m_mnq:
+        raw = _sim_3bar_reversal(bars_15m_mnq, "MNQ", interval_mins=15)
+        results["mnq_3bar_15m"] = _stats(raw["trades"], "MNQ 3-Bar Reversal 15m")
 
     # ── Combined daily projection ──
     all_daily: dict = {}
