@@ -126,7 +126,19 @@ def get_state() -> dict:
 
 # ─── Session detection ───────────────────────────────────────────────────────
 
+MARKET_CLOSED_START = 16 * 60   # 4:00 PM ET — CME daily close
+MARKET_CLOSED_END   = 18 * 60   # 6:00 PM ET — CME daily reopen
+
+
+def _market_open() -> bool:
+    """CME futures are closed 4:00–6:00 PM ET every day."""
+    mins = datetime.now(NY_TZ).hour * 60 + datetime.now(NY_TZ).minute
+    return not (MARKET_CLOSED_START <= mins < MARKET_CLOSED_END)
+
+
 def _current_session() -> Optional[dict]:
+    if not _market_open():
+        return None
     now = datetime.now(NY_TZ)
     mins = now.hour * 60 + now.minute
 
@@ -344,8 +356,12 @@ async def _loop():
             _current_session_name = session["name"] if session else "Off"
 
             if not session:
-                _log("No active session — waiting")
-                await asyncio.sleep(60)
+                if not _market_open():
+                    _log("Market closed (4–6 PM ET) — waiting for 6 PM reopen")
+                    await asyncio.sleep(120)
+                else:
+                    _log("No active trading session — waiting")
+                    await asyncio.sleep(60)
                 continue
 
             # Session trade cap

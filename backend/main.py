@@ -42,10 +42,28 @@ async def _background_refresh():
         await asyncio.sleep(300)  # 5 minutes
 
 
+async def _codespace_keepalive():
+    """Self-ping every 90s so the Codespace VM never sleeps, even with browser closed.
+    The bot needs the server alive 24/7 to catch Asia/London sessions overnight."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            # Use asyncio transport directly to avoid an httpx import here
+            reader, writer = await asyncio.open_connection("127.0.0.1", 8000)
+            writer.write(b"GET /api/health HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            await writer.drain()
+            await reader.read(256)
+            writer.close()
+        except Exception:
+            pass
+        await asyncio.sleep(90)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    yahoo_task = asyncio.create_task(_background_refresh())
+    yahoo_task     = asyncio.create_task(_background_refresh())
+    keepalive_task = asyncio.create_task(_codespace_keepalive())
 
     # ProjectX live data (non-blocking — logs warning if creds missing)
     import providers.projectx as px
@@ -53,6 +71,7 @@ async def lifespan(app: FastAPI):
 
     yield
     yahoo_task.cancel()
+    keepalive_task.cancel()
     px_task.cancel()
     if px._ws_market:
         try:
