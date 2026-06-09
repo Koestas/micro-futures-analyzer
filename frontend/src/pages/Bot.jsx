@@ -1,12 +1,10 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 
-const API = 'http://localhost:8000'
-
 function cn(...c) { return c.filter(Boolean).join(' ') }
 
 const SESSIONS = [
-  { name: 'Asia',    time: '9 PM – 1 AM ET',   symbol: 'MGC',       color: 'text-yellow-400' },
+  { name: 'Asia',    time: '9 PM – 1 AM ET',    symbol: 'MGC',       color: 'text-yellow-400' },
   { name: 'London',  time: '3 AM – 5 AM ET',    symbol: 'MNQ / MES', color: 'text-blue-400'   },
   { name: 'NY AM',   time: '9:30 – 11:30 AM ET',symbol: 'MNQ / MES', color: 'text-green-400'  },
   { name: 'NY PM',   time: '1:30 – 3:30 PM ET', symbol: 'MNQ',       color: 'text-purple-400' },
@@ -22,22 +20,22 @@ export default function Bot() {
 
   const { data, isLoading } = useQuery({
     queryKey: ['bot-status'],
-    queryFn: () => fetch(`${API}/api/bot/status`).then(r => r.json()),
+    queryFn: () => fetch('/api/bot/status').then(r => r.json()),
     refetchInterval: 5000,
   })
 
   const pxStatus = useQuery({
     queryKey: ['px-status'],
-    queryFn: () => fetch(`${API}/api/projectx/status`).then(r => r.json()),
+    queryFn: () => fetch('/api/projectx/status').then(r => r.json()),
     refetchInterval: 10000,
   })
 
-  const startMut  = useMutation({ mutationFn: () => fetch(`${API}/api/bot/start`,    { method: 'POST' }).then(r => r.json()), onSuccess: () => qc.invalidateQueries(['bot-status']) })
-  const stopMut   = useMutation({ mutationFn: () => fetch(`${API}/api/bot/stop`,     { method: 'POST' }).then(r => r.json()), onSuccess: () => qc.invalidateQueries(['bot-status']) })
-  const closeAll  = useMutation({ mutationFn: () => fetch(`${API}/api/bot/close-all`,{ method: 'POST' }).then(r => r.json()), onSuccess: () => qc.invalidateQueries(['bot-status']) })
-  const forceMut  = useMutation({
+  const startMut = useMutation({ mutationFn: () => fetch('/api/bot/start',     { method: 'POST' }).then(r => r.json()), onSuccess: () => qc.invalidateQueries(['bot-status']) })
+  const stopMut  = useMutation({ mutationFn: () => fetch('/api/bot/stop',      { method: 'POST' }).then(r => r.json()), onSuccess: () => qc.invalidateQueries(['bot-status']) })
+  const closeAll = useMutation({ mutationFn: () => fetch('/api/bot/close-all', { method: 'POST' }).then(r => r.json()), onSuccess: () => qc.invalidateQueries(['bot-status']) })
+  const forceMut = useMutation({
     mutationFn: () => fetch(
-      `${API}/api/bot/force-trade?symbol=${forceSymbol}&side=${forceSide}&size=${forceSize}&stop_ticks=${forceStop}&tp_ticks=${forceTp}`,
+      `/api/bot/force-trade?symbol=${forceSymbol}&side=${forceSide}&size=${forceSize}&stop_ticks=${forceStop}&tp_ticks=${forceTp}`,
       { method: 'POST' }
     ).then(r => r.json()),
     onSuccess: () => qc.invalidateQueries(['bot-status']),
