@@ -4,7 +4,7 @@ import {
   LayoutDashboard, Activity, BarChart2, TrendingUp, Zap,
   Table2, Layers, BookOpen, Newspaper, List, History,
   BookMarked, Settings2, ChevronLeft, ChevronRight, Crosshair, ShieldAlert, LineChart,
-  GraduationCap, FlaskConical, ClipboardCheck
+  GraduationCap, FlaskConical, ClipboardCheck, Bot
 } from 'lucide-react'
 import { clsx } from 'clsx'
 
@@ -17,6 +17,7 @@ const NAV = [
   { to: '/raw-chain', icon: Table2, label: 'Raw Chain' },
   { to: '/leadership', icon: Layers, label: 'Leadership' },
   { to: '/structure', icon: BookOpen, label: 'Structure' },
+  { to: '/bot', icon: Bot, label: 'Live Bot' },
   { to: '/ict', icon: Crosshair, label: 'ICT / SMC' },
   { to: '/checklist', icon: ClipboardCheck, label: 'Pre-Trade Check' },
   { to: '/risk', icon: ShieldAlert, label: 'Risk Manager' },

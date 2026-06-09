@@ -21,6 +21,7 @@ from routes.risk import router as risk_router
 from routes.learn import router as learn_router
 from routes.backtest import router as backtest_router
 from routes.projectx import router as projectx_router
+from routes.autotrader import router as autotrader_router
 
 
 async def _background_refresh():
@@ -82,6 +83,7 @@ app.include_router(risk_router)
 app.include_router(learn_router)
 app.include_router(backtest_router)
 app.include_router(projectx_router)
+app.include_router(autotrader_router)
 
 
 @app.exception_handler(Exception)

@@ -24,6 +24,7 @@ import Charts from './pages/Charts'
 import Learn from './pages/Learn'
 import Backtest from './pages/Backtest'
 import Checklist from './pages/Checklist'
+import Bot from './pages/Bot'
 
 function KeepAlive() {
   useEffect(() => {
@@ -67,6 +68,7 @@ export default function App() {
                 <Route path="/learn" element={<Learn />} />
                 <Route path="/backtest" element={<Backtest />} />
                 <Route path="/checklist" element={<Checklist />} />
+                <Route path="/bot" element={<Bot />} />
                 <Route path="*" element={<Overview />} />
               </Routes>
             </ErrorBoundary>
