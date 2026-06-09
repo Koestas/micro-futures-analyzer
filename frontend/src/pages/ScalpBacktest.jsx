@@ -159,7 +159,7 @@ export default function ScalpBacktest() {
                         <td className="py-1 text-right font-mono">{t.entry}</td>
                         <td className="py-1 text-right font-mono">{t.exit}</td>
                         <td className="py-1 text-center">
-                          <span className={cn('px-1 rounded', t.outcome==='win'?'text-green-400':'t.outcome==="loss"?text-red-400':'text-gray-400')}>{t.outcome}</span>
+                          <span className={cn('px-1 rounded', t.outcome==='win'?'text-green-400':t.outcome==='loss'?'text-red-400':'text-gray-400')}>{t.outcome}</span>
                         </td>
                         <td className={cn('py-1 text-right font-bold', pnlColor(t.pnl))}>${t.pnl>=0?'+':''}{t.pnl}</td>
                         <td className="py-1 text-right text-gray-400">{t.adx}</td>

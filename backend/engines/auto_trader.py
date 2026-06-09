@@ -419,8 +419,8 @@ async def _scalp_loop():
                     side=setup["side"],
                     size=setup["contracts"],
                     order_type=2,
-                    stop_loss_ticks=setup["stop_ticks"],
-                    take_profit_ticks=setup["tp_ticks"],
+                    # No brackets — use plain market order, position monitor manages exit
+                    # Enable "Auto OCO Brackets" in TopstepX settings to use brackets instead
                 )
 
                 if result.get("success"):
@@ -660,6 +660,33 @@ async def _monitor_positions():
             else:           # short
                 float_pnl = (entry - cur_price) * usd_pt * rem_ct
 
+            # ── Hard stop loss — close full position if past SL ──────────
+            sl_price = _active_trade.get("stop_price")
+            if sl_price and rem_ct > 0:
+                hit_sl = (side == 0 and cur_price <= sl_price) or \
+                         (side == 1 and cur_price >= sl_price)
+                if hit_sl:
+                    _log(f"SL HIT — closing {sym} @ {cur_price:.2f} (SL={sl_price:.2f})", "error")
+                    await px.close_position(sym)
+                    _active_trade = {}
+                    await _sync_pnl()
+                    asyncio.create_task(tg.alert_trade_closed(sym, _active_trade.get("direction",""), float_pnl, _daily_pnl, _active_trade.get("session","")))
+                    continue
+
+            # ── Take profit — close at 2R ──────────────────────────────────
+            tp_price = _active_trade.get("tp_price") or (
+                (entry + stop_d * 2) if side == 0 else (entry - stop_d * 2)
+            )
+            hit_tp = (side == 0 and cur_price >= tp_price) or \
+                     (side == 1 and cur_price <= tp_price)
+            if hit_tp:
+                _log(f"TP HIT — closing {sym} @ {cur_price:.2f} (TP={tp_price:.2f})", "warning")
+                await px.close_position(sym)
+                _active_trade = {}
+                await _sync_pnl()
+                asyncio.create_task(tg.alert_trade_closed(sym, _active_trade.get("direction",""), float_pnl, _daily_pnl, _active_trade.get("session","")))
+                continue
+
             # ── Partial close at +1R ──────────────────────────────────────
             if not _active_trade.get("partial_done") and rem_ct > 2:
                 threshold_1r = stop_d * usd_pt * rem_ct  # 1R in $
@@ -886,9 +913,7 @@ async def _loop():
                 symbol=setup["instrument"],
                 side=setup["side"],
                 size=setup["contracts"],
-                order_type=2,                      # market
-                stop_loss_ticks=setup["stop_ticks"],
-                take_profit_ticks=setup["stop_ticks"] * 2,  # 2R target
+                order_type=2,   # plain market — no brackets until Auto OCO enabled in TopstepX
             )
 
             if result.get("success"):
@@ -905,8 +930,6 @@ async def _loop():
                             side=setup["side"],
                             size=setup["contracts"],
                             order_type=2,
-                            stop_loss_ticks=setup["stop_ticks"],
-                            take_profit_ticks=setup["stop_ticks"] * 2,
                             account_id=mirror_id,
                         )
                         if mr.get("success"):
@@ -930,6 +953,7 @@ async def _loop():
                     "total_contracts":     setup["contracts"],
                     "remaining_contracts": setup["contracts"],
                     "stop_price":          setup["sl_price"],
+                    "tp_price":            setup["tp_price"],
                     "stop_order_id":       stop_oid,
                     "partial_done":        False,
                     "stop_dist":           setup["stop_dist"],
