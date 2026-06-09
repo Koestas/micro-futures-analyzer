@@ -36,11 +36,16 @@ UTC   = pytz.UTC
 
 # ─── Constants ──────────────────────────────────────────────────────────────
 
-DAILY_TARGET    = 800.0      # start trailing / protecting at this P&L
+DAILY_TARGET    = 600.0      # start trailing / protecting at this P&L
 DAILY_MAX_LOSS  = 1000.0     # 50K DLL equivalent
 TRAIL_INCREMENT = 50.0       # move stop up every $50 of additional gain above target
 PARTIAL_RATIO   = 0.60       # close this fraction at +1R (60% → lock gain, 40% runners)
-MAX_DAILY_TRADES = 12        # across all sessions
+MAX_DAILY_TRADES = 12        # ICT swing trades across all sessions
+
+# Scalp layer — runs every 30s alongside the ICT loop
+SCALP_TARGET_USD    = 50.0   # minimum scalp profit target in dollars
+MAX_SCALP_PER_DAY   = 8      # hard cap on pure scalp trades
+SCALP_HOLD_SECS     = 300    # max hold time before force-close (5 min)
 
 # Market closed 4:00–6:00 PM ET (CME daily break)
 MARKET_CLOSED_START = 16 * 60
@@ -49,10 +54,10 @@ MARKET_CLOSED_END   = 18 * 60
 # ─── Session definitions (6:15 PM → 3:50 PM ET next day) ────────────────────
 
 SESSIONS = [
-    {   # Market just reopened — structure still forming from US close momentum
+    {   # Market reopens at 6 PM ET — scan immediately for structure setups
         "name": "Post-Open",
         "instruments": ["MGC", "MNQ"],
-        "start_et": (18, 15), "end_et": (21, 0),
+        "start_et": (18, 0), "end_et": (21, 0),
         "wraps_midnight": False,
         "min_score": 62, "contracts": 3, "max_trades": 1,
         "vol_regime_pct": 3.5, "sweep_max_age_mins": 240,
@@ -65,9 +70,9 @@ SESSIONS = [
         "min_score": 58, "contracts": 5, "max_trades": 2,
         "vol_regime_pct": 2.5, "sweep_max_age_mins": 300,
     },
-    {   # Asia–London handoff — Gold still active, NQ starting to move
+    {   # Asia–London handoff — NQ/MES taking over, Gold done for the night
         "name": "Asia-London",
-        "instruments": ["MNQ", "MES", "MGC"],
+        "instruments": ["MNQ", "MES"],
         "start_et": (1, 0), "end_et": (3, 0),
         "wraps_midnight": False,
         "min_score": 60, "contracts": 4, "max_trades": 1,
@@ -136,6 +141,11 @@ _trail_floor     : float = 0.0   # highest trail lock set so far
 _active_trade: dict = {}  # {symbol, entry_price, side, total_contracts, remaining_contracts,
                            #  stop_price, stop_order_id, partial_done, direction, config}
 
+# Scalp layer state
+_scalp_task         = None
+_scalp_today        : int = 0
+_last_scalp_time    : dict = {}   # symbol → datetime of last scalp entry
+
 
 def _log(msg: str, level: str = "info"):
     ts = datetime.now(NY_TZ).strftime("%H:%M:%S ET")
@@ -151,8 +161,10 @@ def get_state() -> dict:
         "running":         _running,
         "daily_pnl":       _daily_pnl,
         "trades_today":    _trades_today,
+        "scalp_today":     _scalp_today,
         "trail_mode":      _trail_mode,
         "trail_floor":     _trail_floor,
+        "daily_target":    DAILY_TARGET,
         "last_signal":     _last_signal,
         "current_session": _current_session_name,
         "last_check":      _last_check,
@@ -220,6 +232,233 @@ def _vol_ok(bars: list, pct_limit: float) -> bool:
             _log(f"Vol regime {d}: {(hi-lo)/lo*100:.1f}% > {pct_limit}% → skip")
             return False
     return True
+
+
+# ─── Scalp engine (1m bars + live bid/ask) ───────────────────────────────────
+
+def _analyze_scalp(bars_1m: list, bars_5m: list, instrument: str) -> Optional[dict]:
+    """
+    Quick scalp signal on 1m bars + live quote.
+    Dakota-style: momentum burst + VWAP alignment + volume surge.
+    No full ICT analysis needed — pure price action + structure.
+
+    Returns setup dict or None.
+    """
+    if len(bars_1m) < 10:
+        return None
+
+    config  = _INSTRUMENT_CONFIG.get(instrument.upper(), _INSTRUMENT_CONFIG["MNQ"])
+    usd_pt  = config["dollars_per_point"]
+    tick    = config["tick_size"]
+
+    recent  = bars_1m[-20:]
+    last    = bars_1m[-1]
+    price   = last["close"]
+
+    # ── Live bid/ask spread check ─────────────────────────────────────────
+    quote = px.get_quote(instrument.upper())
+    bid   = quote.get("bestBid") if quote else None
+    ask   = quote.get("bestAsk") if quote else None
+    if bid and ask:
+        spread_ticks = round((ask - bid) / tick)
+        if spread_ticks > 3:   # > 3 ticks = too wide, skip
+            return None
+        live_price = (bid + ask) / 2   # mid-price for analysis
+    else:
+        live_price = price
+        spread_ticks = 0
+
+    # ── Momentum: last 3 × 1m bars all same direction ────────────────────
+    last3 = bars_1m[-3:]
+    bull_bars = sum(1 for b in last3 if b["close"] > b["open"])
+    bear_bars = sum(1 for b in last3 if b["close"] < b["open"])
+
+    if bull_bars == 3:
+        direction = "bullish"
+        side = 0
+    elif bear_bars == 3:
+        direction = "bearish"
+        side = 1
+    else:
+        return None   # no clean momentum
+
+    # ── Volume surge on the last bar ─────────────────────────────────────
+    avg_vol = sum(b.get("volume", 0) for b in recent[:-1]) / max(len(recent) - 1, 1)
+    last_vol = last.get("volume", 0)
+    if avg_vol > 0 and last_vol < avg_vol * 1.2:
+        return None   # no volume confirmation
+
+    # ── VWAP alignment (use 5m bars for more stable VWAP) ────────────────
+    now_et = _bar_dt(last)
+    vwap   = _calc_vwap_at(bars_5m, now_et) if bars_5m else None
+    if vwap:
+        tol = 0.006 if instrument == "MGC" else 0.004
+        if direction == "bullish" and live_price < vwap * (1 - tol):
+            return None  # price clearly below VWAP — skip long
+        if direction == "bearish" and live_price > vwap * (1 + tol):
+            return None  # price clearly above VWAP — skip short
+
+    # ── RSI not at extreme ────────────────────────────────────────────────
+    rsi = _calc_rsi(recent)
+    if direction == "bullish" and rsi > 80:
+        return None
+    if direction == "bearish" and rsi < 20:
+        return None
+
+    # ── ADX: market must be moving ────────────────────────────────────────
+    adx = _calc_adx(recent)
+    if adx < 12:
+        return None
+
+    # ── Size for $50+ target ──────────────────────────────────────────────
+    # Stop: 3 ticks for MGC, 8 ticks for MNQ/MES
+    stop_ticks = 8 if instrument.upper() != "MGC" else 6
+    tp_ticks   = stop_ticks * 2   # 1:2 RR on scalps
+
+    stop_pts   = stop_ticks * tick
+    tp_pts     = tp_ticks   * tick
+    usd_risk   = stop_pts   * usd_pt
+
+    # Calculate how many contracts to hit $50 target
+    usd_per_tp = tp_pts * usd_pt
+    contracts  = max(1, int(SCALP_TARGET_USD / usd_per_tp) + 1)
+    contracts  = min(contracts, config["max_contracts"])
+
+    usd_target = tp_pts * usd_pt * contracts
+
+    if direction == "bullish":
+        sl_price = round(live_price - stop_pts, 2)
+        tp_price = round(live_price + tp_pts,   2)
+    else:
+        sl_price = round(live_price + stop_pts, 2)
+        tp_price = round(live_price - tp_pts,   2)
+
+    return {
+        "type":        "scalp",
+        "instrument":  instrument.upper(),
+        "direction":   direction,
+        "side":        side,
+        "entry_price": live_price,
+        "sl_price":    sl_price,
+        "tp_price":    tp_price,
+        "stop_ticks":  stop_ticks,
+        "tp_ticks":    tp_ticks,
+        "contracts":   contracts,
+        "usd_risk":    round(usd_risk * contracts, 2),
+        "usd_target":  round(usd_target, 2),
+        "spread_ticks":spread_ticks,
+        "rsi":         round(rsi, 1),
+        "adx":         round(adx, 1),
+        "vol_surge":   round(last_vol / avg_vol, 1) if avg_vol > 0 else 0,
+        "vwap":        round(vwap, 2) if vwap else None,
+        "timestamp":   datetime.now(NY_TZ).isoformat(),
+        "session":     _current_session_name,
+    }
+
+
+async def _scalp_loop():
+    """
+    Runs every 30 seconds — scans 1m bars for quick scalp setups.
+    Completely separate from the ICT swing loop.
+    Targets $50+ per trade with tight 8-tick stops.
+    Max 5-minute hold — bracket orders manage exit automatically.
+    """
+    global _scalp_today, _last_scalp_time
+
+    _log("Scalp engine started — scanning every 30s on 1m bars")
+
+    while _running:
+        await asyncio.sleep(30)
+
+        if not _market_open():
+            continue
+
+        # Don't scalp if daily limits hit
+        if _daily_pnl <= -DAILY_MAX_LOSS:
+            continue
+        if _scalp_today >= MAX_SCALP_PER_DAY:
+            continue
+        if (_trades_today + _scalp_today) >= (MAX_DAILY_TRADES + MAX_SCALP_PER_DAY):
+            continue
+
+        # Don't scalp if already in a position
+        positions = await px.get_positions()
+        if positions:
+            continue
+
+        # News filter
+        clear, ev, mins_away = _news_clear(_current_session_name)
+        if not clear:
+            continue
+
+        # MGC only trades in Asia/Post-Open (6 PM – 1 AM ET)
+        now_mins = datetime.now(NY_TZ).hour * 60 + datetime.now(NY_TZ).minute
+        is_gold_hour = now_mins >= 18 * 60 or now_mins <= 1 * 60
+        scalp_instruments = ["MNQ", "MES"] + (["MGC"] if is_gold_hour else [])
+
+        for instrument in scalp_instruments:
+            try:
+                # Cool-down: 3 minutes between scalps on same symbol
+                last_t = _last_scalp_time.get(instrument)
+                if last_t and (datetime.now(NY_TZ) - last_t).total_seconds() < 180:
+                    continue
+
+                bars_1m = await px.get_bars(instrument, interval="1m", limit=30)
+                bars_5m = await px.get_bars(instrument, interval="5m", limit=50)
+                if not bars_1m:
+                    continue
+                if bars_1m[0]["time"] > bars_1m[-1]["time"]:
+                    bars_1m = list(reversed(bars_1m))
+                if bars_5m and bars_5m[0]["time"] > bars_5m[-1]["time"]:
+                    bars_5m = list(reversed(bars_5m))
+
+                setup = _analyze_scalp(bars_1m, bars_5m, instrument)
+                if not setup:
+                    continue
+
+                _log(
+                    f"⚡ SCALP {instrument} {setup['direction'].upper()} "
+                    f"x{setup['contracts']} | "
+                    f"spread={setup['spread_ticks']}tks "
+                    f"vol×{setup['vol_surge']} "
+                    f"ADX={setup['adx']} RSI={setup['rsi']} "
+                    f"target=${setup['usd_target']:.0f}",
+                    "warning"
+                )
+
+                result = await px.place_order(
+                    symbol=instrument,
+                    side=setup["side"],
+                    size=setup["contracts"],
+                    order_type=2,
+                    stop_loss_ticks=setup["stop_ticks"],
+                    take_profit_ticks=setup["tp_ticks"],
+                )
+
+                if result.get("success"):
+                    _scalp_today += 1
+                    _last_scalp_time[instrument] = datetime.now(NY_TZ)
+                    _trade_log.append({**setup, "order_id": result.get("orderId")})
+
+                    # Telegram alert (brief for scalps)
+                    side_str = "🟢 LONG" if setup["side"] == 0 else "🔴 SHORT"
+                    asyncio.create_task(tg.send(
+                        f"⚡ <b>SCALP</b> {side_str} <b>{instrument}</b> ×{setup['contracts']}\n"
+                        f"Entry: <code>{setup['entry_price']:.2f}</code> | "
+                        f"SL: <code>{setup['sl_price']:.2f}</code> | "
+                        f"TP: <code>{setup['tp_price']:.2f}</code>\n"
+                        f"Target: <b>${setup['usd_target']:.0f}</b> | "
+                        f"ADX={setup['adx']} spread={setup['spread_ticks']}tks"
+                    ))
+                    _log(f"Scalp order placed — ID {result.get('orderId')}")
+                    break   # one scalp at a time
+                else:
+                    _log(f"Scalp rejected: {result.get('errorMessage')}", "error")
+
+            except Exception as e:
+                _log(f"Scalp error {instrument}: {e}", "error")
+
+    _log("Scalp engine stopped")
 
 
 # ─── News filter ─────────────────────────────────────────────────────────────
@@ -517,7 +756,9 @@ async def _loop():
             # Daily reset at midnight
             if now_et.hour == 0 and now_et.minute < 2:
                 _trades_today = 0
+                _scalp_today  = 0
                 _session_trades.clear()
+                _last_scalp_time.clear()
                 _trail_mode   = False
                 _trail_floor  = 0.0
                 _log("New trading day — all counters reset")
@@ -702,20 +943,21 @@ async def _loop():
 # ─── Start / Stop ─────────────────────────────────────────────────────────────
 
 async def start():
-    global _running, _task, _monitor_task
+    global _running, _task, _monitor_task, _scalp_task
     if _running:
         return False
     _running      = True
     _task         = asyncio.create_task(_loop())
     _monitor_task = asyncio.create_task(_monitor_positions())
+    _scalp_task   = asyncio.create_task(_scalp_loop())
     return True
 
 
 async def stop():
-    global _running, _task, _monitor_task
+    global _running, _task, _monitor_task, _scalp_task
     _running = False
-    for t in (_task, _monitor_task):
+    for t in (_task, _monitor_task, _scalp_task):
         if t:
             t.cancel()
-    _task = _monitor_task = None
+    _task = _monitor_task = _scalp_task = None
     return True

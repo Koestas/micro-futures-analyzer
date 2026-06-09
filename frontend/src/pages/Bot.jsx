@@ -89,7 +89,9 @@ export default function Bot() {
         <Stat label="Bot Status"    value={running ? '● LIVE' : '○ Stopped'} color={running ? 'text-green-400' : 'text-gray-500'} />
         <Stat label="Session"       value={session} />
         <Stat label="Today P&L"     value={`$${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`} color={pnlColor} />
-        <Stat label="Trades Today"  value={trades} />
+        <Stat label="ICT Trades"    value={trades} />
+        <Stat label="Scalps Today"  value={data?.scalp_today ?? 0} />
+        <Stat label="Daily Target"  value={`$${data?.daily_target ?? 600}`} small />
         <Stat label="Last Check"    value={lastCheck} small />
       </div>
 
