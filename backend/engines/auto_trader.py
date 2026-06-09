@@ -419,8 +419,8 @@ async def _scalp_loop():
                     side=setup["side"],
                     size=setup["contracts"],
                     order_type=2,
-                    # No brackets — use plain market order, position monitor manages exit
-                    # Enable "Auto OCO Brackets" in TopstepX settings to use brackets instead
+                    stop_loss_ticks=setup["stop_ticks"],
+                    take_profit_ticks=setup["tp_ticks"],
                 )
 
                 if result.get("success"):
@@ -660,27 +660,28 @@ async def _monitor_positions():
             else:           # short
                 float_pnl = (entry - cur_price) * usd_pt * rem_ct
 
-            # ── Hard stop loss — close full position if past SL ──────────
+            # ── SL/TP safety net (primary execution is TopstepX Auto OCO brackets) ──
+            # Brackets handle the initial exit instantly at the exchange level.
+            # This 30s poll acts as a backup if the bracket somehow fails.
             sl_price = _active_trade.get("stop_price")
             if sl_price and rem_ct > 0:
                 hit_sl = (side == 0 and cur_price <= sl_price) or \
                          (side == 1 and cur_price >= sl_price)
                 if hit_sl:
-                    _log(f"SL HIT — closing {sym} @ {cur_price:.2f} (SL={sl_price:.2f})", "error")
+                    _log(f"SL BACKUP HIT — closing {sym} @ {cur_price:.2f} (SL={sl_price:.2f})", "error")
                     await px.close_position(sym)
                     _active_trade = {}
                     await _sync_pnl()
                     asyncio.create_task(tg.alert_trade_closed(sym, _active_trade.get("direction",""), float_pnl, _daily_pnl, _active_trade.get("session","")))
                     continue
 
-            # ── Take profit — close at 2R ──────────────────────────────────
             tp_price = _active_trade.get("tp_price") or (
                 (entry + stop_d * 2) if side == 0 else (entry - stop_d * 2)
             )
             hit_tp = (side == 0 and cur_price >= tp_price) or \
                      (side == 1 and cur_price <= tp_price)
             if hit_tp:
-                _log(f"TP HIT — closing {sym} @ {cur_price:.2f} (TP={tp_price:.2f})", "warning")
+                _log(f"TP BACKUP HIT — closing {sym} @ {cur_price:.2f} (TP={tp_price:.2f})", "warning")
                 await px.close_position(sym)
                 _active_trade = {}
                 await _sync_pnl()
@@ -909,16 +910,21 @@ async def _loop():
                 f"SL={setup['sl_price']:.2f}  2R_TP={setup['tp_price']:.2f}"
             )
 
+            sl_ticks = setup["stop_ticks"]
+            tp_ticks = sl_ticks * 2   # 2R target
+
             result = await px.place_order(
                 symbol=setup["instrument"],
                 side=setup["side"],
                 size=setup["contracts"],
-                order_type=2,   # plain market — no brackets until Auto OCO enabled in TopstepX
+                order_type=2,
+                stop_loss_ticks=sl_ticks,
+                take_profit_ticks=tp_ticks,
             )
 
             if result.get("success"):
                 order_id = result.get("orderId")
-                _log(f"ORDER PLACED — ID {order_id}", "warning")
+                _log(f"ORDER PLACED — ID {order_id} | SL {sl_ticks}t TP {tp_ticks}t (brackets active)", "warning")
                 asyncio.create_task(tg.alert_trade_opened(setup))
 
                 # Mirror to additional accounts if configured
@@ -930,6 +936,8 @@ async def _loop():
                             side=setup["side"],
                             size=setup["contracts"],
                             order_type=2,
+                            stop_loss_ticks=sl_ticks,
+                            take_profit_ticks=tp_ticks,
                             account_id=mirror_id,
                         )
                         if mr.get("success"):
