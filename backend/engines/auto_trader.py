@@ -1,13 +1,19 @@
-"""Live ICT auto-trader — runs against the ProjectX/TopstepX practice account.
+"""Live ICT auto-trader — ProjectX/TopstepX practice account.
 
-Sessions:
-  Asia    21:00–01:00 ET   MGC (Gold)
-  London  03:00–05:00 ET   MNQ / MES
-  NY AM   09:30–11:30 ET   MNQ / MES  (primary)
-  NY PM   13:30–15:30 ET   MNQ        (secondary, higher score bar)
+Trading window: 6:15 PM – 3:50 PM ET (all CME hours, skip 4–6 PM close).
+8 sessions cover the full window; instruments and score floors vary by session quality.
 
-Each session allows up to 2 trades. Max daily loss $3K on the 150K practice account.
-Runs as an asyncio background task started from main.py lifespan.
+$800/day target:
+  • When realized P&L crosses $800: enter trail mode
+  • In trail mode: partial close runners to lock $800 floor, trail every $50 above
+  • New setups still entered but at 50% size to keep compounding
+  • Hard stop: $1,000 daily loss limit (50K DLL equivalent on 150K practice)
+
+Position management:
+  • Entry: market order + stop loss bracket only (no TP bracket — managed manually)
+  • At +1R floating: partial close 60% of contracts (lock partial gain)
+  • Remaining 40% = runners with trailing stop
+  • Trail stop: move up every $50 of additional P&L above $800 floor
 """
 
 import asyncio
@@ -17,121 +23,147 @@ from typing import Optional
 import pytz
 
 import providers.projectx as px
-from engines.ict import get_ict_analysis, extract_session_levels, get_htf_bias
+from engines.ict import get_ict_analysis, get_htf_bias
 from engines.ict_signals import _INSTRUMENT_CONFIG
 from routes.backtest import (
-    _bar_dt, _calc_atr, _calc_sma, _calc_rsi, _calc_adx,
-    _calc_vwap_at, _get_30min_vwap_bias,
+    _bar_dt, _calc_atr, _calc_sma, _calc_rsi, _calc_adx, _calc_vwap_at,
 )
 
 logger = logging.getLogger(__name__)
 NY_TZ = pytz.timezone("America/New_York")
 UTC   = pytz.UTC
 
-# ─── Session definitions ────────────────────────────────────────────────────
+# ─── Constants ──────────────────────────────────────────────────────────────
+
+DAILY_TARGET    = 800.0      # start trailing / protecting at this P&L
+DAILY_MAX_LOSS  = 1000.0     # 50K DLL equivalent
+TRAIL_INCREMENT = 50.0       # move stop up every $50 of additional gain above target
+PARTIAL_RATIO   = 0.60       # close this fraction at +1R (60% → lock gain, 40% runners)
+MAX_DAILY_TRADES = 12        # across all sessions
+
+# Market closed 4:00–6:00 PM ET (CME daily break)
+MARKET_CLOSED_START = 16 * 60
+MARKET_CLOSED_END   = 18 * 60
+
+# ─── Session definitions (6:15 PM → 3:50 PM ET next day) ────────────────────
 
 SESSIONS = [
-    {
-        "name": "Asia",
-        "instruments": ["MGC"],
-        "start_et": (21, 0),
-        "end_et":   (1,  0),     # wraps midnight
-        "wraps_midnight": True,
-        "min_score": 58,
-        "contracts": 5,
-        "vol_regime_pct": 2.5,
-        "require_mss": False,
-        "sweep_max_age_mins": 300,
-        "max_trades": 2,
+    {   # Market just reopened — structure still forming from US close momentum
+        "name": "Post-Open",
+        "instruments": ["MGC", "MNQ"],
+        "start_et": (18, 15), "end_et": (21, 0),
+        "wraps_midnight": False,
+        "min_score": 62, "contracts": 3, "max_trades": 1,
+        "vol_regime_pct": 3.5, "sweep_max_age_mins": 240,
     },
-    {
+    {   # Asia session — Gold prime time, NQ gets structure from US levels
+        "name": "Asia",
+        "instruments": ["MGC", "MNQ"],
+        "start_et": (21, 0), "end_et": (1, 0),
+        "wraps_midnight": True,
+        "min_score": 58, "contracts": 5, "max_trades": 2,
+        "vol_regime_pct": 2.5, "sweep_max_age_mins": 300,
+    },
+    {   # Asia–London handoff — Gold still active, NQ starting to move
+        "name": "Asia-London",
+        "instruments": ["MNQ", "MES", "MGC"],
+        "start_et": (1, 0), "end_et": (3, 0),
+        "wraps_midnight": False,
+        "min_score": 60, "contracts": 4, "max_trades": 1,
+        "vol_regime_pct": 3.0, "sweep_max_age_mins": 240,
+    },
+    {   # London open — NQ/ES at their most predictable overnight
         "name": "London",
         "instruments": ["MNQ", "MES"],
-        "start_et": (3, 0),
-        "end_et":   (5, 0),
+        "start_et": (3, 0), "end_et": (5, 0),
         "wraps_midnight": False,
-        "min_score": 62,
-        "contracts": 5,
-        "vol_regime_pct": 4.0,
-        "require_mss": False,
-        "sweep_max_age_mins": 180,
-        "max_trades": 2,
+        "min_score": 62, "contracts": 5, "max_trades": 2,
+        "vol_regime_pct": 4.0, "sweep_max_age_mins": 180,
     },
-    {
+    {   # Pre-market — London close to NY open, decent volume building
+        "name": "Pre-Market",
+        "instruments": ["MNQ", "MES"],
+        "start_et": (5, 0), "end_et": (9, 30),
+        "wraps_midnight": False,
+        "min_score": 64, "contracts": 4, "max_trades": 1,
+        "vol_regime_pct": 3.5, "sweep_max_age_mins": 300,
+    },
+    {   # NY AM killzone — highest quality, prime session
         "name": "NY AM",
         "instruments": ["MNQ", "MES"],
-        "start_et": (9, 30),
-        "end_et":   (11, 30),
+        "start_et": (9, 30), "end_et": (11, 30),
         "wraps_midnight": False,
-        "min_score": 65,
-        "contracts": 5,
-        "vol_regime_pct": 4.0,
-        "require_mss": True,
-        "sweep_max_age_mins": 90,
-        "max_trades": 2,
+        "min_score": 65, "contracts": 5, "max_trades": 2,
+        "vol_regime_pct": 4.0, "sweep_max_age_mins": 90,
     },
-    {
-        "name": "NY PM",
+    {   # Midday lull — lower quality, smaller size, high bar
+        "name": "Midday",
         "instruments": ["MNQ"],
-        "start_et": (13, 30),
-        "end_et":   (15, 30),
+        "start_et": (11, 30), "end_et": (13, 30),
         "wraps_midnight": False,
-        "min_score": 68,
-        "contracts": 4,
-        "vol_regime_pct": 4.0,
-        "require_mss": False,
-        "sweep_max_age_mins": 330,
-        "max_trades": 1,
+        "min_score": 70, "contracts": 3, "max_trades": 1,
+        "vol_regime_pct": 3.5, "sweep_max_age_mins": 300,
+    },
+    {   # NY PM — strong momentum setups into close
+        "name": "NY PM",
+        "instruments": ["MNQ", "MES"],
+        "start_et": (13, 30), "end_et": (15, 50),
+        "wraps_midnight": False,
+        "min_score": 67, "contracts": 5, "max_trades": 2,
+        "vol_regime_pct": 4.0, "sweep_max_age_mins": 330,
     },
 ]
 
 # ─── State ──────────────────────────────────────────────────────────────────
 
-_running    = False
-_task       = None
-_trade_log  : list = []          # all trades taken this session
-_bot_log    : list = []          # status / signal messages
-_daily_pnl  : float = 0.0
-_trades_today: int = 0
-_session_trades: dict = {}       # session_name → count today
-_last_signal: dict = {}
+_running         = False
+_task            = None
+_monitor_task    = None
+_trade_log       : list = []
+_bot_log         : list = []
+_daily_pnl       : float = 0.0
+_trades_today    : int = 0
+_session_trades  : dict = {}
+_last_signal     : dict = {}
 _current_session_name: str = ""
-_last_check: str = ""
+_last_check      : str = ""
+_trail_mode      : bool = False
+_trail_locked_pnl: float = 0.0   # P&L level we're protecting
+_trail_floor     : float = 0.0   # highest trail lock set so far
 
-MAX_DAILY_LOSS = 3000.0          # hard stop for 150K practice account
-MAX_DAILY_TRADES = 6             # across all sessions
+# Active trade tracking for position management
+_active_trade: dict = {}  # {symbol, entry_price, side, total_contracts, remaining_contracts,
+                           #  stop_price, stop_order_id, partial_done, direction, config}
 
 
 def _log(msg: str, level: str = "info"):
     ts = datetime.now(NY_TZ).strftime("%H:%M:%S ET")
     entry = {"ts": ts, "msg": msg, "level": level}
     _bot_log.append(entry)
-    if len(_bot_log) > 200:
+    if len(_bot_log) > 300:
         _bot_log.pop(0)
     getattr(logger, level)(f"[AutoTrader] {msg}")
 
 
 def get_state() -> dict:
     return {
-        "running":       _running,
-        "daily_pnl":     _daily_pnl,
-        "trades_today":  _trades_today,
-        "last_signal":   _last_signal,
+        "running":         _running,
+        "daily_pnl":       _daily_pnl,
+        "trades_today":    _trades_today,
+        "trail_mode":      _trail_mode,
+        "trail_floor":     _trail_floor,
+        "last_signal":     _last_signal,
         "current_session": _current_session_name,
-        "last_check":    _last_check,
-        "trade_log":     _trade_log[-20:],
-        "bot_log":       _bot_log[-50:],
+        "last_check":      _last_check,
+        "active_trade":    _active_trade,
+        "trade_log":       _trade_log[-30:],
+        "bot_log":         _bot_log[-60:],
     }
 
 
-# ─── Session detection ───────────────────────────────────────────────────────
-
-MARKET_CLOSED_START = 16 * 60   # 4:00 PM ET — CME daily close
-MARKET_CLOSED_END   = 18 * 60   # 6:00 PM ET — CME daily reopen
-
+# ─── Market / session helpers ─────────────────────────────────────────────────
 
 def _market_open() -> bool:
-    """CME futures are closed 4:00–6:00 PM ET every day."""
     mins = datetime.now(NY_TZ).hour * 60 + datetime.now(NY_TZ).minute
     return not (MARKET_CLOSED_START <= mins < MARKET_CLOSED_END)
 
@@ -139,17 +171,14 @@ def _market_open() -> bool:
 def _current_session() -> Optional[dict]:
     if not _market_open():
         return None
-    now = datetime.now(NY_TZ)
+    now  = datetime.now(NY_TZ)
     mins = now.hour * 60 + now.minute
-
     for s in SESSIONS:
         sh, sm = s["start_et"]
         eh, em = s["end_et"]
         start_m = sh * 60 + sm
         end_m   = eh * 60 + em
-
         if s["wraps_midnight"]:
-            # e.g. 21:00–01:00 → active if mins >= 1260 OR mins <= 60
             if mins >= start_m or mins <= end_m:
                 return s
         else:
@@ -158,29 +187,25 @@ def _current_session() -> Optional[dict]:
     return None
 
 
-# ─── Bar helpers ─────────────────────────────────────────────────────────────
+# ─── Bar helpers ──────────────────────────────────────────────────────────────
 
-async def _fetch_live_bars(symbol: str, n: int = 300) -> list:
-    """Get n 5-min bars from ProjectX. Returns newest-to-oldest, sorted ascending."""
-    bars = await px.get_bars(symbol, interval="5m", limit=n)
-    if bars and bars[0]["time"] > bars[-1]["time"]:
-        bars = list(reversed(bars))   # ensure ascending time
-    return bars
-
-
-async def _fetch_daily_bars(symbol: str) -> list:
-    bars = await px.get_bars(symbol, interval="1d", limit=30)
-    if bars and bars[0]["time"] > bars[-1]["time"]:
-        bars = list(reversed(bars))
-    return bars
+async def _bars(symbol: str, n: int = 300) -> list:
+    raw = await px.get_bars(symbol, interval="5m", limit=n)
+    if raw and raw[0]["time"] > raw[-1]["time"]:
+        raw = list(reversed(raw))
+    return raw
 
 
-# ─── Vol regime check (last 3 trading days) ──────────────────────────────────
+async def _daily_bars(symbol: str) -> list:
+    raw = await px.get_bars(symbol, interval="1d", limit=30)
+    if raw and raw[0]["time"] > raw[-1]["time"]:
+        raw = list(reversed(raw))
+    return raw
 
-def _vol_ok(bars: list, pct_limit: float = 4.0) -> bool:
-    """Return False if any of the last 3 days had an intraday range > pct_limit%."""
-    if not bars:
-        return True
+
+# ─── Vol regime ───────────────────────────────────────────────────────────────
+
+def _vol_ok(bars: list, pct_limit: float) -> bool:
     by_day: dict = {}
     for b in bars:
         d = _bar_dt(b).date()
@@ -191,26 +216,35 @@ def _vol_ok(bars: list, pct_limit: float = 4.0) -> bool:
         hi = max(b["high"] for b in day)
         lo = min(b["low"]  for b in day)
         if lo > 0 and (hi - lo) / lo * 100 > pct_limit:
-            _log(f"Vol regime: {d} range {(hi-lo)/lo*100:.1f}% > {pct_limit}% — skipping", "warning")
+            _log(f"Vol regime {d}: {(hi-lo)/lo*100:.1f}% > {pct_limit}% → skip")
             return False
     return True
 
 
-# ─── Setup analysis ──────────────────────────────────────────────────────────
+# ─── P&L sync ─────────────────────────────────────────────────────────────────
 
-def _analyze_bars(bars: list, instrument: str, session: dict) -> Optional[dict]:
-    """
-    Run ICT analysis on live bars. Return a setup dict or None.
-    Uses the same logic as the backtest engine but on live data.
-    """
+async def _sync_pnl():
+    global _daily_pnl
+    trades = await px.get_trade_history(days_back=1)
+    today  = str(date.today())
+    _daily_pnl = round(sum(
+        (t.get("profitAndLoss") or 0) - (t.get("fees") or 0)
+        for t in trades
+        if t.get("creationTimestamp", "")[:10] == today
+    ), 2)
+
+
+# ─── Setup analysis ───────────────────────────────────────────────────────────
+
+def _analyze(bars: list, instrument: str, session: dict) -> Optional[dict]:
     if len(bars) < 30:
         return None
 
-    recent   = bars[-150:]   # last 12.5 hours of 5m bars for context
+    recent   = bars[-150:]
     last_bar = bars[-1]
     price    = last_bar["close"]
+    config   = _INSTRUMENT_CONFIG.get(instrument.upper(), _INSTRUMENT_CONFIG["MNQ"])
 
-    # ── ICT analysis ────────────────────────────────────────────────────────
     analysis = get_ict_analysis(recent, current_price=price)
     long_sc  = analysis.get("long_setup",  {}).get("score", 0) or 0
     short_sc = analysis.get("short_setup", {}).get("score", 0) or 0
@@ -221,112 +255,213 @@ def _analyze_bars(bars: list, instrument: str, session: dict) -> Optional[dict]:
     direction = "bullish" if long_sc >= short_sc else "bearish"
     score     = long_sc if direction == "bullish" else short_sc
 
-    # ── Quality filters (mirrors backtest _find_killzone_setup) ─────────────
-    config = _INSTRUMENT_CONFIG.get(instrument.upper(), _INSTRUMENT_CONFIG["MNQ"])
-
-    # 1. ADX: skip ranging markets
+    # ADX: trending market required
     adx = _calc_adx(recent[-60:])
     if adx < 10:
-        _log(f"{instrument} ADX {adx:.1f} < 10 — ranging, skip")
         return None
 
-    # 2. RSI: don't chase extremes
+    # RSI: don't chase extremes
     rsi = _calc_rsi(recent[-60:])
-    if direction == "bullish" and rsi > 78:
-        _log(f"{instrument} RSI {rsi:.1f} overbought — skip long")
+    if direction == "bullish" and rsi > 80:
         return None
-    if direction == "bearish" and rsi < 22:
-        _log(f"{instrument} RSI {rsi:.1f} oversold — skip short")
+    if direction == "bearish" and rsi < 20:
         return None
 
-    # 3. VWAP position
-    now_et  = _bar_dt(last_bar)
-    vwap    = _calc_vwap_at(bars, now_et)
+    # VWAP filter (wider tolerance for off-hours)
+    now_et = _bar_dt(last_bar)
+    vwap   = _calc_vwap_at(bars, now_et)
+    tol    = 0.005 if instrument == "MGC" else 0.004
     if vwap:
-        tol = 0.004 if instrument == "MGC" else 0.003  # gold wider tolerance
         if direction == "bullish" and price < vwap * (1 - tol):
-            _log(f"{instrument} price {price} below VWAP {vwap:.2f} — skip long")
             return None
         if direction == "bearish" and price > vwap * (1 + tol):
-            _log(f"{instrument} price {price} above VWAP {vwap:.2f} — skip short")
             return None
 
-    # 4. 200 SMA trend filter
-    sma200 = _calc_sma(recent, 200)
-    if sma200:
-        if direction == "bullish" and price < sma200 * 0.996:
-            _log(f"{instrument} price below 200 SMA — skip long")
+    # 200 SMA
+    sma = _calc_sma(recent, 200)
+    if sma:
+        if direction == "bullish" and price < sma * 0.994:
             return None
-        if direction == "bearish" and price > sma200 * 1.004:
-            _log(f"{instrument} price above 200 SMA — skip short")
+        if direction == "bearish" and price > sma * 1.006:
             return None
 
-    # ── Stop & target calculation ────────────────────────────────────────────
-    atr        = _calc_atr(recent[-20:])
-    stop_dist  = max(atr * 1.5, config["min_stop_pts"], config["stop_buffer"])
-    # Hard cap per instrument
-    caps = {"MNQ": 120, "MES": 60, "MGC": 18}
-    stop_dist  = min(stop_dist, caps.get(instrument, 120))
+    # Stop & target
+    atr       = _calc_atr(recent[-20:])
+    stop_dist = max(atr * 1.5, config["min_stop_pts"], config["stop_buffer"])
+    caps      = {"MNQ": 120, "MES": 60, "MGC": 20}
+    stop_dist = min(stop_dist, caps.get(instrument, 120))
 
-    tick       = config["tick_size"]
-    stop_ticks = round(stop_dist / tick)
-    tp_ticks   = round(stop_ticks * 2)   # 2R target
+    tick        = config["tick_size"]
+    stop_ticks  = max(1, round(stop_dist / tick))
 
-    entry_price = price
+    side = 0 if direction == "bullish" else 1
+
+    # In trail mode, use half contracts to preserve gains but keep compounding
+    contracts = session["contracts"]
+    if _trail_mode:
+        contracts = max(2, contracts // 2)
+    contracts = min(contracts, config["max_contracts"])
+
+    usd_per_pt  = config["dollars_per_point"]
+    usd_risk    = stop_dist * usd_per_pt * contracts
+    usd_1r      = usd_risk  # profit at 1R = same as risk
+    usd_2r      = usd_risk * 2
+
     if direction == "bullish":
-        sl_price = round(entry_price - stop_dist, 2)
-        tp_price = round(entry_price + stop_dist * 2, 2)
-        side = 0   # Buy
+        sl_price = price - stop_dist
+        tp_price = price + stop_dist * 2
     else:
-        sl_price = round(entry_price + stop_dist, 2)
-        tp_price = round(entry_price - stop_dist * 2, 2)
-        side = 1   # Sell
-
-    # Contracts: use session config but cap at instrument max
-    contracts = min(session["contracts"], config["max_contracts"])
-    usd_risk  = stop_dist * config["dollars_per_point"] * contracts
+        sl_price = price + stop_dist
+        tp_price = price - stop_dist * 2
 
     return {
         "instrument":   instrument,
         "direction":    direction,
         "side":         side,
-        "score":        score,
-        "entry_price":  entry_price,
-        "sl_price":     sl_price,
-        "tp_price":     tp_price,
+        "score":        round(score),
+        "entry_price":  price,
+        "sl_price":     round(sl_price, 2),
+        "tp_price":     round(tp_price, 2),
         "stop_ticks":   stop_ticks,
-        "tp_ticks":     tp_ticks,
+        "stop_dist":    round(stop_dist, 2),
         "contracts":    contracts,
         "atr":          round(atr, 2),
         "adx":          round(adx, 1),
         "rsi":          round(rsi, 1),
         "usd_risk":     round(usd_risk, 2),
+        "usd_1r":       round(usd_1r, 2),
+        "usd_2r":       round(usd_2r, 2),
         "session":      session["name"],
         "timestamp":    datetime.now(NY_TZ).isoformat(),
+        "config":       config,
     }
 
 
-# ─── Daily P&L sync ──────────────────────────────────────────────────────────
+# ─── Position monitoring (partial close + trailing) ──────────────────────────
 
-async def _sync_daily_pnl():
-    global _daily_pnl
-    trades = await px.get_trade_history(days_back=1)
-    today  = date.today()
-    gross  = sum(
-        (t.get("profitAndLoss") or 0) - (t.get("fees") or 0)
-        for t in trades
-        if t.get("creationTimestamp", "")[:10] == str(today)
-    )
-    _daily_pnl = round(gross, 2)
+async def _find_stop_order_id(account_id: int, contract_id: str) -> Optional[int]:
+    """Find the stop-loss bracket order ID for an open position."""
+    orders = await px.get_open_orders(account_id)
+    for o in orders:
+        if o.get("contractId") == contract_id and o.get("type") in (3, 4, 5):  # Stop/StopLimit/Trail
+            return o.get("id")
+    return None
 
 
-# ─── Main loop ───────────────────────────────────────────────────────────────
+async def _monitor_positions():
+    """Runs every 30s — manages partial closes and trailing stops."""
+    global _active_trade, _trail_mode, _trail_floor, _trail_locked_pnl, _daily_pnl
+
+    while _running:
+        await asyncio.sleep(30)
+        if not _active_trade or not _running:
+            continue
+
+        try:
+            sym      = _active_trade.get("symbol")
+            config   = _active_trade.get("config", {})
+            entry    = _active_trade.get("entry_price", 0)
+            side     = _active_trade.get("side", 0)   # 0=long 1=short
+            rem_ct   = _active_trade.get("remaining_contracts", 0)
+            stop_d   = _active_trade.get("stop_dist", 20)
+            usd_pt   = config.get("dollars_per_point", 2)
+            tick     = config.get("tick_size", 0.25)
+
+            if rem_ct <= 0:
+                _active_trade = {}
+                continue
+
+            # Current price
+            positions = await px.get_positions()
+            if not positions:
+                _log(f"Position closed — trade complete")
+                _active_trade = {}
+                await _sync_pnl()
+                continue
+
+            pos = next((p for p in positions if sym in (p.get("symbol", ""), p.get("contractId", ""))), None)
+            if not pos:
+                _active_trade = {}
+                await _sync_pnl()
+                continue
+
+            quote = px.get_quote(sym)
+            if not quote:
+                continue
+            cur_price = quote.get("lastPrice", entry)
+
+            # Floating P&L on remaining contracts
+            if side == 0:   # long
+                float_pnl = (cur_price - entry) * usd_pt * rem_ct
+            else:           # short
+                float_pnl = (entry - cur_price) * usd_pt * rem_ct
+
+            # ── Partial close at +1R ──────────────────────────────────────
+            if not _active_trade.get("partial_done") and rem_ct > 2:
+                threshold_1r = stop_d * usd_pt * rem_ct  # 1R in $
+                if float_pnl >= threshold_1r * 0.85:     # 85% of 1R triggers
+                    close_ct = max(1, int(rem_ct * PARTIAL_RATIO))
+                    if close_ct >= rem_ct:
+                        close_ct = rem_ct - 1  # always leave at least 1 runner
+
+                    _log(f"Partial close {close_ct}/{rem_ct} @ +${float_pnl:.0f} (1R hit)", "warning")
+                    data = await px.partial_close_position(sym, close_ct)
+                    if data.get("success"):
+                        _active_trade["remaining_contracts"] = rem_ct - close_ct
+                        _active_trade["partial_done"] = True
+                        _log(f"Partial close OK — {rem_ct - close_ct} runners left")
+                    else:
+                        _log(f"Partial close failed: {data.get('errorMessage')}", "error")
+
+            # ── Total P&L sync ────────────────────────────────────────────
+            await _sync_pnl()
+            total_pnl = _daily_pnl + float_pnl
+
+            # ── Trail mode entry ──────────────────────────────────────────
+            if total_pnl >= DAILY_TARGET and not _trail_mode:
+                _trail_mode       = True
+                _trail_locked_pnl = DAILY_TARGET
+                _trail_floor      = DAILY_TARGET
+                _log(f"Trail mode activated — P&L ${total_pnl:.0f} >= target ${DAILY_TARGET:.0f} ✓", "warning")
+
+            # ── Trail stop management ─────────────────────────────────────
+            if _trail_mode and _active_trade.get("stop_order_id"):
+                # Raise trail floor every $50 of gain above current floor
+                new_floor = _trail_floor + TRAIL_INCREMENT * int(
+                    (total_pnl - _trail_floor) / TRAIL_INCREMENT
+                )
+                if new_floor > _trail_floor + TRAIL_INCREMENT * 0.9:
+                    gain_to_protect = new_floor - _daily_pnl  # how much floating we must keep
+                    pts_to_protect  = gain_to_protect / (usd_pt * rem_ct) if rem_ct > 0 else 0
+
+                    # New stop price: moves in direction of trade to lock in gains
+                    if side == 0:   # long — stop moves UP
+                        new_stop_price = round(cur_price - pts_to_protect, 2)
+                        new_stop_ticks = max(4, round(pts_to_protect / tick))
+                    else:           # short — stop moves DOWN
+                        new_stop_price = round(cur_price + pts_to_protect, 2)
+                        new_stop_ticks = max(4, round(pts_to_protect / tick))
+
+                    data = await px.modify_order(
+                        _active_trade["stop_order_id"],
+                        stop_price=new_stop_price,
+                    )
+                    if data.get("success"):
+                        _trail_floor = new_floor
+                        _active_trade["stop_price"] = new_stop_price
+                        _log(f"Stop trailed → {new_stop_price:.2f} | floor ${new_floor:.0f} locked", "warning")
+
+        except Exception as e:
+            _log(f"Monitor error: {e}", "error")
+
+
+# ─── Main trading loop ────────────────────────────────────────────────────────
 
 async def _loop():
     global _running, _last_signal, _current_session_name, _last_check
-    global _daily_pnl, _trades_today
+    global _daily_pnl, _trades_today, _trail_mode, _trail_floor
 
-    _log("Auto-trader started ✓")
+    _log("Auto-trader started ✓  |  Target $800/day  |  22-hr coverage")
 
     while _running:
         try:
@@ -337,123 +472,144 @@ async def _loop():
             if now_et.hour == 0 and now_et.minute < 2:
                 _trades_today = 0
                 _session_trades.clear()
-                _log("New trading day — counters reset")
+                _trail_mode   = False
+                _trail_floor  = 0.0
+                _log("New trading day — all counters reset")
 
-            # Hard daily loss limit
-            await _sync_daily_pnl()
-            if _daily_pnl <= -MAX_DAILY_LOSS:
-                _log(f"Daily loss ${abs(_daily_pnl):.0f} >= ${MAX_DAILY_LOSS:.0f} limit — trading paused", "warning")
-                await asyncio.sleep(300)
-                continue
-
-            if _trades_today >= MAX_DAILY_TRADES:
-                _log(f"Max daily trades ({MAX_DAILY_TRADES}) reached — resting")
-                await asyncio.sleep(300)
-                continue
-
-            # Identify current session
-            session = _current_session()
-            _current_session_name = session["name"] if session else "Off"
-
-            if not session:
-                if not _market_open():
-                    _log("Market closed (4–6 PM ET) — waiting for 6 PM reopen")
-                    await asyncio.sleep(120)
-                else:
-                    _log("No active trading session — waiting")
-                    await asyncio.sleep(60)
-                continue
-
-            # Session trade cap
-            sess_count = _session_trades.get(session["name"], 0)
-            if sess_count >= session["max_trades"]:
-                _log(f"{session['name']}: max trades ({session['max_trades']}) reached — waiting for next session")
+            # Market closed?
+            if not _market_open():
+                _current_session_name = "Closed (4–6 PM ET)"
+                _log("Market closed — waiting for 6 PM ET reopen")
                 await asyncio.sleep(120)
                 continue
 
-            # Skip if already in a position
-            positions = await px.get_positions()
-            if positions:
-                pos_info = positions[0]
-                _log(f"Position open: {pos_info.get('contractId')} size={pos_info.get('size')} — monitoring")
-                await asyncio.sleep(30)
+            # Hard daily loss limit
+            await _sync_pnl()
+            if _daily_pnl <= -DAILY_MAX_LOSS:
+                _current_session_name = "HALTED — daily loss limit"
+                _log(f"Daily loss ${abs(_daily_pnl):.0f} hit ${DAILY_MAX_LOSS:.0f} limit — halted for day", "error")
+                await asyncio.sleep(600)
                 continue
 
-            # Try each instrument in the session until we find a setup
+            if _trades_today >= MAX_DAILY_TRADES:
+                _log(f"Max {MAX_DAILY_TRADES} trades reached — resting until next session")
+                await asyncio.sleep(300)
+                continue
+
+            session = _current_session()
+            _current_session_name = session["name"] if session else "Between sessions"
+
+            if not session:
+                _log("Between sessions — waiting")
+                await asyncio.sleep(60)
+                continue
+
+            sess_count = _session_trades.get(session["name"], 0)
+            if sess_count >= session["max_trades"]:
+                await asyncio.sleep(120)
+                continue
+
+            # Already in a position? Monitor handles it, just wait
+            positions = await px.get_positions()
+            if positions:
+                await asyncio.sleep(45)
+                continue
+
+            # Scan instruments
             setup = None
             for instrument in session["instruments"]:
-                bars = await _fetch_live_bars(instrument, n=300)
-                if not bars:
-                    _log(f"No bars for {instrument}", "warning")
+                bar_data = await _bars(instrument)
+                if not bar_data:
                     continue
 
-                # Vol regime check
-                if not _vol_ok(bars, pct_limit=session["vol_regime_pct"]):
+                if not _vol_ok(bar_data, session.get("vol_regime_pct", 4.0)):
                     continue
 
-                daily_bars = await _fetch_daily_bars(instrument)
-                htf = get_htf_bias(daily_bars) if daily_bars else {}
-                htf_dir = htf.get("direction", "neutral") if htf else "neutral"
+                daily = await _daily_bars(instrument)
+                htf   = get_htf_bias(daily) if daily else {}
+                htf_dir = htf.get("direction", "neutral")
 
-                candidate = _analyze_bars(bars, instrument, session)
+                candidate = _analyze(bar_data, instrument, session)
                 if not candidate:
-                    _log(f"{session['name']} | {instrument}: no A/A+ setup (HTF={htf_dir})")
+                    _log(f"{session['name']} | {instrument}: no setup (HTF={htf_dir}, score<{session['min_score']})")
                     continue
 
-                # HTF alignment check
-                cand_dir = candidate["direction"]
-                if htf_dir in ("strong_bullish", "bullish", "bullish_lean") and cand_dir == "bearish":
-                    _log(f"{instrument}: contra-trend bearish vs HTF {htf_dir} — skip")
+                # HTF alignment
+                d = candidate["direction"]
+                if htf_dir in ("strong_bullish","bullish","bullish_lean") and d == "bearish":
+                    _log(f"{instrument}: contra HTF {htf_dir} — skip")
                     continue
-                if htf_dir in ("strong_bearish", "bearish", "bearish_lean") and cand_dir == "bullish":
-                    _log(f"{instrument}: contra-trend bullish vs HTF {htf_dir} — skip")
+                if htf_dir in ("strong_bearish","bearish","bearish_lean") and d == "bullish":
+                    _log(f"{instrument}: contra HTF {htf_dir} — skip")
                     continue
 
+                candidate["htf_direction"] = htf_dir
                 setup = candidate
-                setup["htf_direction"] = htf_dir
                 _log(
-                    f"✓ Setup: {instrument} {cand_dir.upper()} | "
+                    f"✓ {session['name']} | {instrument} {d.upper()} "
                     f"score={candidate['score']} ADX={candidate['adx']} RSI={candidate['rsi']} "
-                    f"risk=${candidate['usd_risk']:.0f}"
+                    f"x{candidate['contracts']} risk=${candidate['usd_risk']:.0f} "
+                    f"HTF={htf_dir} {'[TRAIL MODE]' if _trail_mode else ''}"
                 )
                 break
 
-            _last_signal = setup or {
-                "session": session["name"],
-                "timestamp": now_et.isoformat(),
-                "result": "no setup",
-            }
-
+            _last_signal = setup or {"session": session["name"],
+                                     "timestamp": now_et.isoformat(), "result": "no setup"}
             if not setup:
                 await asyncio.sleep(60)
                 continue
 
-            # ── Place order ───────────────────────────────────────────────────
+            # ── Place order — stop bracket only, manage TP manually ──────
             _log(
                 f"PLACING: {setup['instrument']} {setup['direction'].upper()} "
                 f"x{setup['contracts']} @ {setup['entry_price']:.2f} | "
-                f"SL={setup['sl_price']:.2f} TP={setup['tp_price']:.2f}"
+                f"SL={setup['sl_price']:.2f}  2R_TP={setup['tp_price']:.2f}"
             )
 
             result = await px.place_order(
                 symbol=setup["instrument"],
                 side=setup["side"],
                 size=setup["contracts"],
-                order_type=2,                    # Market
+                order_type=2,                      # market
                 stop_loss_ticks=setup["stop_ticks"],
-                take_profit_ticks=setup["tp_ticks"],
+                take_profit_ticks=setup["stop_ticks"] * 2,  # 2R target
             )
 
             if result.get("success"):
                 order_id = result.get("orderId")
-                _log(f"ORDER FILLED — ID {order_id} | {setup['instrument']} {setup['direction']} x{setup['contracts']}", "warning")
-                _trade_log.append({**setup, "order_id": order_id, "status": "open"})
+                _log(f"ORDER PLACED — ID {order_id}", "warning")
+
+                # Wait briefly then find the stop bracket order ID
+                await asyncio.sleep(3)
+                contract_id = px._contract_cache.get(setup["instrument"])
+                stop_oid = await _find_stop_order_id(px._account_id, contract_id)
+
+                global _active_trade
+                _active_trade = {
+                    "symbol":              setup["instrument"],
+                    "direction":           setup["direction"],
+                    "side":                setup["side"],
+                    "entry_price":         setup["entry_price"],
+                    "total_contracts":     setup["contracts"],
+                    "remaining_contracts": setup["contracts"],
+                    "stop_price":          setup["sl_price"],
+                    "stop_order_id":       stop_oid,
+                    "partial_done":        False,
+                    "stop_dist":           setup["stop_dist"],
+                    "order_id":            order_id,
+                    "config":              setup["config"],
+                    "usd_1r":              setup["usd_1r"],
+                    "session":             session["name"],
+                    "timestamp":           setup["timestamp"],
+                }
+
+                _trade_log.append({**setup, "order_id": order_id, "stop_order_id": stop_oid})
                 _trades_today += 1
                 _session_trades[session["name"]] = sess_count + 1
-                # Give time for fill, then next check
-                await asyncio.sleep(120)
+                _log(f"Trade tracked | stop_order_id={stop_oid} | 1R=${setup['usd_1r']:.0f}")
+                await asyncio.sleep(90)  # wait before next scan
             else:
-                err = result.get("errorMessage", "unknown error")
+                err = result.get("errorMessage", "unknown")
                 _log(f"ORDER REJECTED: {err}", "error")
                 await asyncio.sleep(60)
 
@@ -469,18 +625,20 @@ async def _loop():
 # ─── Start / Stop ─────────────────────────────────────────────────────────────
 
 async def start():
-    global _running, _task
+    global _running, _task, _monitor_task
     if _running:
         return False
-    _running = True
-    _task = asyncio.create_task(_loop())
+    _running      = True
+    _task         = asyncio.create_task(_loop())
+    _monitor_task = asyncio.create_task(_monitor_positions())
     return True
 
 
 async def stop():
-    global _running, _task
+    global _running, _task, _monitor_task
     _running = False
-    if _task:
-        _task.cancel()
-        _task = None
+    for t in (_task, _monitor_task):
+        if t:
+            t.cancel()
+    _task = _monitor_task = None
     return True

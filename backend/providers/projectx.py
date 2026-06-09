@@ -387,6 +387,49 @@ async def cancel_order(order_id: int, account_id: Optional[int] = None) -> dict:
         return {"success": False, "errorMessage": str(e)}
 
 
+async def partial_close_position(symbol: str, size: int, account_id: Optional[int] = None) -> dict:
+    token = await _ensure_token()
+    if not token:
+        return {"success": False, "errorMessage": "Not authenticated"}
+    aid = await _resolve_account(account_id)
+    contract_id = await get_contract_id(symbol)
+    if not contract_id:
+        return {"success": False, "errorMessage": f"No contract for {symbol}"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{BASE_URL}/api/Position/partialCloseContract",
+                json={"accountId": aid, "contractId": contract_id, "size": size},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            return resp.json()
+    except Exception as e:
+        return {"success": False, "errorMessage": str(e)}
+
+
+async def modify_order(order_id: int, stop_price: Optional[float] = None,
+                       limit_price: Optional[float] = None, size: Optional[int] = None,
+                       account_id: Optional[int] = None) -> dict:
+    token = await _ensure_token()
+    if not token:
+        return {"success": False, "errorMessage": "Not authenticated"}
+    aid = await _resolve_account(account_id)
+    payload = {"accountId": aid, "orderId": order_id}
+    if stop_price  is not None: payload["stopPrice"]  = stop_price
+    if limit_price is not None: payload["limitPrice"] = limit_price
+    if size        is not None: payload["size"]       = size
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{BASE_URL}/api/Order/modify",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            return resp.json()
+    except Exception as e:
+        return {"success": False, "errorMessage": str(e)}
+
+
 async def close_position(symbol: str, account_id: Optional[int] = None) -> dict:
     token = await _ensure_token()
     if not token:
