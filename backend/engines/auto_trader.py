@@ -44,7 +44,7 @@ MAX_DAILY_TRADES = 12        # ICT swing trades across all sessions
 
 # Scalp layer — runs every 30s alongside the ICT loop
 SCALP_TARGET_USD    = 50.0   # minimum scalp profit target in dollars
-MAX_SCALP_PER_DAY   = 8      # hard cap on pure scalp trades
+MAX_SCALP_PER_DAY   = 4      # conservative cap until strategy is validated
 SCALP_HOLD_SECS     = 300    # max hold time before force-close (5 min)
 
 # Market closed 4:00–6:00 PM ET (CME daily break)
@@ -145,6 +145,9 @@ _active_trade: dict = {}  # {symbol, entry_price, side, total_contracts, remaini
 _scalp_task         = None
 _scalp_today        : int = 0
 _last_scalp_time    : dict = {}   # symbol → datetime of last scalp entry
+
+# End-of-day summary tracking
+_eod_sent           : bool = False   # reset each trading day
 
 
 def _log(msg: str, level: str = "info"):
@@ -268,46 +271,57 @@ def _analyze_scalp(bars_1m: list, bars_5m: list, instrument: str) -> Optional[di
         live_price = price
         spread_ticks = 0
 
-    # ── Momentum: last 3 × 1m bars all same direction ────────────────────
-    last3 = bars_1m[-3:]
-    bull_bars = sum(1 for b in last3 if b["close"] > b["open"])
-    bear_bars = sum(1 for b in last3 if b["close"] < b["open"])
+    # ── Momentum: 5 of last 5 bars SAME direction (strict — no noise) ────
+    last5 = bars_1m[-5:]
+    bull_bars = sum(1 for b in last5 if b["close"] > b["open"])
+    bear_bars = sum(1 for b in last5 if b["close"] < b["open"])
 
-    if bull_bars == 3:
+    if bull_bars >= 4:
         direction = "bullish"
         side = 0
-    elif bear_bars == 3:
+    elif bear_bars >= 4:
         direction = "bearish"
         side = 1
     else:
-        return None   # no clean momentum
+        return None
 
-    # ── Volume surge on the last bar ─────────────────────────────────────
-    avg_vol = sum(b.get("volume", 0) for b in recent[:-1]) / max(len(recent) - 1, 1)
+    # ── Each bar must have meaningful body (displacement, not doji) ───────
+    min_body_pct = 0.0008  # 0.08% of price = ~23 pts on MNQ
+    for b in last5:
+        body = abs(b["close"] - b["open"])
+        if body < b["close"] * min_body_pct:
+            return None  # doji / tiny body = noise, skip
+
+    # ── Volume surge: last bar must be 2× average (real momentum) ────────
+    avg_vol  = sum(b.get("volume", 0) for b in recent[:-1]) / max(len(recent) - 1, 1)
     last_vol = last.get("volume", 0)
-    if avg_vol > 0 and last_vol < avg_vol * 1.2:
-        return None   # no volume confirmation
+    if avg_vol > 0 and last_vol < avg_vol * 2.0:
+        return None  # not a volume surge — skip
 
-    # ── VWAP alignment (use 5m bars for more stable VWAP) ────────────────
+    # ── ADX: strong trend required ────────────────────────────────────────
+    adx = _calc_adx(recent)
+    if adx < 20:
+        return None
+
+    # ── RSI must be in momentum zone (not at extreme or ranging) ─────────
+    rsi = _calc_rsi(recent)
+    if direction == "bullish" and (rsi > 78 or rsi < 45):
+        return None  # overbought or not trending up
+    if direction == "bearish" and (rsi < 22 or rsi > 55):
+        return None
+
+    # ── VWAP: price must be on the right side ────────────────────────────
     now_et = _bar_dt(last)
     vwap   = _calc_vwap_at(bars_5m, now_et) if bars_5m else None
     if vwap:
-        tol = 0.006 if instrument == "MGC" else 0.004
+        tol = 0.003 if instrument == "MGC" else 0.002
         if direction == "bullish" and live_price < vwap * (1 - tol):
-            return None  # price clearly below VWAP — skip long
+            return None
         if direction == "bearish" and live_price > vwap * (1 + tol):
-            return None  # price clearly above VWAP — skip short
+            return None
 
-    # ── RSI not at extreme ────────────────────────────────────────────────
-    rsi = _calc_rsi(recent)
-    if direction == "bullish" and rsi > 80:
-        return None
-    if direction == "bearish" and rsi < 20:
-        return None
-
-    # ── ADX: market must be moving ────────────────────────────────────────
-    adx = _calc_adx(recent)
-    if adx < 12:
+    # ── Vol regime: no scalps on high-volatility days ────────────────────
+    if not _vol_ok(bars_5m, pct_limit=3.5):
         return None
 
     # ── Size for $50+ target ──────────────────────────────────────────────
@@ -391,16 +405,14 @@ async def _scalp_loop():
         if not clear:
             continue
 
-        # MGC only trades in Asia/Post-Open (6 PM – 1 AM ET)
-        now_mins = datetime.now(NY_TZ).hour * 60 + datetime.now(NY_TZ).minute
-        is_gold_hour = now_mins >= 18 * 60 or now_mins <= 1 * 60
-        scalp_instruments = ["MNQ", "MES"] + (["MGC"] if is_gold_hour else [])
-
-        for instrument in scalp_instruments:
+        # Scalp disabled — 1m momentum signal not validated (14% WR in backtest)
+        # Will re-enable with ICT-based scalp criteria (iFVG reject, VWAP touch)
+        # once validated on forward data. For now: ICT swings only.
+        for instrument in []:
             try:
-                # Cool-down: 3 minutes between scalps on same symbol
+                # Cool-down: 10 minutes between scalps on same symbol
                 last_t = _last_scalp_time.get(instrument)
-                if last_t and (datetime.now(NY_TZ) - last_t).total_seconds() < 180:
+                if last_t and (datetime.now(NY_TZ) - last_t).total_seconds() < 600:
                     continue
 
                 bars_1m = await px.get_bars(instrument, interval="1m", limit=30)
@@ -761,7 +773,22 @@ async def _loop():
                 _last_scalp_time.clear()
                 _trail_mode   = False
                 _trail_floor  = 0.0
+                _eod_sent     = False
                 _log("New trading day — all counters reset")
+
+            # ── End-of-day summary at 3:50 PM ET ─────────────────────────
+            if now_et.hour == 15 and now_et.minute == 50 and not _eod_sent:
+                _eod_sent = True
+                today_log = [t for t in _trade_log if t.get("timestamp", "")[:10] == str(now_et.date())]
+                wins_log  = [t for t in today_log if t.get("pnl", 0) > 0]
+                loss_log  = [t for t in today_log if t.get("pnl", 0) <= 0]
+                best  = max((t.get("pnl",0) for t in today_log), default=0)
+                worst = min((t.get("pnl",0) for t in today_log), default=0)
+                asyncio.create_task(tg.alert_daily_summary(
+                    pnl=_daily_pnl, trades=_trades_today, scalps=_scalp_today,
+                    wins=len(wins_log), losses=len(loss_log),
+                    best=best, worst=worst,
+                ))
 
             # Market closed?
             if not _market_open():
@@ -814,6 +841,17 @@ async def _loop():
             # Scan instruments
             setup = None
             for instrument in session["instruments"]:
+                # ── 15m trend confirmation ────────────────────────────────
+                try:
+                    bars_15m = await px.get_bars(instrument, interval="15m", limit=30)
+                    if bars_15m:
+                        if bars_15m[0]["time"] > bars_15m[-1]["time"]:
+                            bars_15m = list(reversed(bars_15m))
+                        closes_15m = [b["close"] for b in bars_15m[-10:]]
+                        sma_15m = sum(closes_15m) / len(closes_15m) if closes_15m else None
+                        last_close_15m = bars_15m[-1]["close"] if bars_15m else None
+                except Exception:
+                    sma_15m = last_close_15m = None
                 bar_data = await _bars(instrument)
                 if not bar_data:
                     continue
@@ -838,6 +876,15 @@ async def _loop():
                 if htf_dir in ("strong_bearish","bearish","bearish_lean") and d == "bullish":
                     _log(f"{instrument}: contra HTF {htf_dir} — skip")
                     continue
+
+                # 15m confirmation: price should be on the right side of 15m SMA
+                if sma_15m and last_close_15m:
+                    if d == "bullish" and last_close_15m < sma_15m * 0.997:
+                        _log(f"{instrument}: 15m below SMA ({last_close_15m:.2f} < {sma_15m:.2f}) — skip long")
+                        continue
+                    if d == "bearish" and last_close_15m > sma_15m * 1.003:
+                        _log(f"{instrument}: 15m above SMA ({last_close_15m:.2f} > {sma_15m:.2f}) — skip short")
+                        continue
 
                 candidate["htf_direction"] = htf_dir
                 setup = candidate
@@ -924,6 +971,30 @@ async def _loop():
                 _trades_today += 1
                 _session_trades[session["name"]] = sess_count + 1
                 _log(f"Trade tracked | stop_order_id={stop_oid} | 1R=${setup['usd_1r']:.0f}")
+
+                # Auto-journal entry
+                try:
+                    from database import save_trade
+                    asyncio.create_task(save_trade({
+                        "symbol":       setup["instrument"],
+                        "direction":    "long" if setup["side"] == 0 else "short",
+                        "entry":        setup["entry_price"],
+                        "exit":         None,
+                        "result":       None,
+                        "r_multiple":   None,
+                        "setup_type":   f"ICT-{session['name']}",
+                        "bias_at_entry": setup.get("htf_direction", ""),
+                        "confidence":   setup["score"],
+                        "notes":        (
+                            f"Bot auto-entry | score={setup['score']} "
+                            f"ADX={setup['adx']} RSI={setup['rsi']} "
+                            f"contracts={setup['contracts']} risk=${setup['usd_risk']:.0f}"
+                        ),
+                        "mistake_tag":  None,
+                        "lesson":       None,
+                    }))
+                except Exception as je:
+                    _log(f"Journal write failed: {je}", "error")
                 await asyncio.sleep(90)  # wait before next scan
             else:
                 err = result.get("errorMessage", "unknown")

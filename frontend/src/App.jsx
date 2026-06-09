@@ -26,6 +26,7 @@ import Backtest from './pages/Backtest'
 import Checklist from './pages/Checklist'
 import Bot from './pages/Bot'
 import BotStats from './pages/BotStats'
+import ScalpBacktest from './pages/ScalpBacktest'
 
 function KeepAlive() {
   useEffect(() => {
@@ -71,6 +72,7 @@ export default function App() {
                 <Route path="/checklist" element={<Checklist />} />
                 <Route path="/bot" element={<Bot />} />
                 <Route path="/bot-stats" element={<BotStats />} />
+                <Route path="/scalp-backtest" element={<ScalpBacktest />} />
                 <Route path="*" element={<Overview />} />
               </Routes>
             </ErrorBoundary>

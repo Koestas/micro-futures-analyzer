@@ -133,8 +133,20 @@ async def alert_news_block(event: str, minutes: int, session: str):
     )
 
 
+async def alert_daily_summary(pnl: float, trades: int, scalps: int, wins: int, losses: int, best: float, worst: float):
+    emoji = "📈" if pnl >= 0 else "📉"
+    await send(
+        f"{emoji} <b>Daily Summary — 3:50 PM ET</b>\n"
+        f"Net P&amp;L: <b>${pnl:+.0f}</b>\n"
+        f"ICT swings: {trades} trades ({wins}W/{losses}L)\n"
+        f"Scalps: {scalps}\n"
+        f"Best trade: <b>${best:+.0f}</b>  |  Worst: <b>${worst:+.0f}</b>\n"
+        f"Bot going flat — resumes 6 PM ET"
+    )
+
+
 async def alert_bot_started():
-    await send("🤖 <b>MFA Bot started</b> — 22-hr coverage active\nTarget: $800/day | Limit: $1,000 loss")
+    await send("🤖 <b>MFA Bot started</b> — 22-hr coverage active\nTarget: $600/day | Limit: $1,000 loss")
 
 
 async def alert_bot_stopped():

@@ -17,6 +17,7 @@ export default function Bot() {
   const [forceSize, setForceSize] = useState(1)
   const [forceStop, setForceStop] = useState(40)
   const [forceTp, setForceTp] = useState(80)
+  const [switchMsg, setSwitchMsg] = useState('')
 
   const { data, isLoading } = useQuery({
     queryKey: ['bot-status'],
@@ -33,6 +34,19 @@ export default function Bot() {
   const startMut = useMutation({ mutationFn: () => fetch('/api/bot/start',     { method: 'POST' }).then(r => r.json()), onSuccess: () => qc.invalidateQueries(['bot-status']) })
   const stopMut  = useMutation({ mutationFn: () => fetch('/api/bot/stop',      { method: 'POST' }).then(r => r.json()), onSuccess: () => qc.invalidateQueries(['bot-status']) })
   const closeAll = useMutation({ mutationFn: () => fetch('/api/bot/close-all', { method: 'POST' }).then(r => r.json()), onSuccess: () => qc.invalidateQueries(['bot-status']) })
+
+  const { data: thinking } = useQuery({
+    queryKey: ['bot-thinking'],
+    queryFn: () => fetch('/api/bot/thinking').then(r => r.json()),
+    refetchInterval: 15_000,
+  })
+
+  const switchAccount = async (accountId) => {
+    const r = await fetch(`/api/bot/switch-account?account_id=${accountId}`, { method: 'POST' }).then(x => x.json())
+    setSwitchMsg(r.success ? `✓ Switched to ${r.name} ($${r.balance?.toLocaleString()})` : `✗ ${r.error}`)
+    qc.invalidateQueries(['bot-status'])
+    qc.invalidateQueries(['px-status'])
+  }
   const forceMut = useMutation({
     mutationFn: () => fetch(
       `/api/bot/force-trade?symbol=${forceSymbol}&side=${forceSide}&size=${forceSize}&stop_ticks=${forceStop}&tp_ticks=${forceTp}`,
@@ -81,6 +95,9 @@ export default function Bot() {
           <button onClick={() => closeAll.mutate()} className="px-3 py-2 bg-orange-700 hover:bg-orange-600 text-white text-sm rounded">
             Close All
           </button>
+          <a href="/scalp-backtest" className="px-3 py-2 bg-terminal-card border border-terminal-border text-gray-400 hover:text-white text-sm rounded">
+            Backtest Results
+          </a>
         </div>
       </div>
 
@@ -207,6 +224,88 @@ export default function Bot() {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* ── What's the bot thinking ── */}
+      {thinking && (
+        <div className="bg-terminal-card border border-terminal-border rounded p-3">
+          <div className="text-xs text-gray-400 font-semibold uppercase mb-3">
+            What's the Bot Thinking — {thinking.session}
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {['MNQ','MES','MGC'].map(sym => {
+              const t = thinking.instruments?.[sym]
+              if (!t || t.status === 'no_data') return (
+                <div key={sym} className="border border-gray-800 rounded p-2 text-xs text-gray-600">{sym}: no data</div>
+              )
+              return (
+                <div key={sym} className={cn('border rounded p-2 text-xs', t.ready ? 'border-green-700 bg-green-950/20' : 'border-terminal-border')}>
+                  <div className="flex justify-between items-center mb-1">
+                    <span className="font-bold text-white">{sym}</span>
+                    <span className="font-mono text-gray-300">${t.price?.toFixed(sym==='MGC'?1:0)}</span>
+                    {t.bid && <span className="text-gray-500">{t.bid?.toFixed(2)}/{t.ask?.toFixed(2)}</span>}
+                  </div>
+                  <div className="flex justify-between mb-1">
+                    <span className="text-gray-400">Score</span>
+                    <span className={cn('font-bold', t.best_score >= t.min_score ? 'text-green-400' : 'text-yellow-400')}>
+                      {t.best_score}/{t.min_score}
+                      {t.score_gap > 0 && <span className="text-gray-500 text-xs ml-1">(-{t.score_gap})</span>}
+                    </span>
+                  </div>
+                  <div className="flex justify-between mb-1">
+                    <span className="text-gray-400">Direction</span>
+                    <span className={t.direction === 'bullish' ? 'text-green-400' : 'text-red-400'}>{t.direction}</span>
+                  </div>
+                  <div className="flex justify-between mb-1">
+                    <span className="text-gray-400">ADX / RSI</span>
+                    <span className="text-white">{t.adx} / {t.rsi}</span>
+                  </div>
+                  {t.vwap && (
+                    <div className="flex justify-between mb-1">
+                      <span className="text-gray-400">VWAP</span>
+                      <span className="text-white">{t.vwap}</span>
+                    </div>
+                  )}
+                  <div className="mt-1 pt-1 border-t border-terminal-border">
+                    {t.ready
+                      ? <span className="text-green-400 font-bold">✓ SETUP READY</span>
+                      : t.blockers?.length > 0
+                        ? <span className="text-yellow-600">{t.blockers[0]}</span>
+                        : <span className="text-gray-600">{t.status}</span>
+                    }
+                    {t.scalp_ready && <span className="text-yellow-400 ml-2">⚡ scalp signal</span>}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── Account switch ── */}
+      {pxStatus.data?.accounts?.length > 1 && (
+        <div className="bg-terminal-card border border-blue-900 rounded p-3">
+          <div className="text-xs text-blue-400 font-semibold uppercase mb-2">Active Trading Account</div>
+          <div className="flex flex-wrap gap-2 items-center">
+            {pxStatus.data.accounts.filter(a => a.canTrade).map(a => (
+              <button key={a.id}
+                onClick={() => switchAccount(a.id)}
+                className={cn(
+                  'px-3 py-1.5 rounded text-xs font-semibold border transition-colors',
+                  a.id === pxStatus.data.account_id
+                    ? 'bg-blue-900 border-blue-600 text-blue-300'
+                    : 'bg-terminal-bg border-terminal-border text-gray-400 hover:border-blue-700'
+                )}
+              >
+                {a.name.startsWith('PRAC') ? '🧪 ' : '💰 '}
+                {a.name.split('-')[0]} ${a.balance.toLocaleString()}
+                {a.id === pxStatus.data.account_id && ' ← active'}
+              </button>
+            ))}
+          </div>
+          {switchMsg && <div className={cn('text-xs mt-2', switchMsg.startsWith('✓') ? 'text-green-400' : 'text-red-400')}>{switchMsg}</div>}
+          <p className="text-xs text-gray-600 mt-2">Switching while bot is running redirects all new trades to the selected account.</p>
         </div>
       )}
 

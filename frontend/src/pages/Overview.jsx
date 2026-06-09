@@ -206,6 +206,19 @@ export default function Overview() {
     staleTime: 20_000,
   })
 
+  const { data: botData } = useQuery({
+    queryKey: ['overview-bot'],
+    queryFn: () => fetch('/api/bot/status').then(r => r.json()),
+    refetchInterval: 10_000,
+  })
+
+  const { data: thinkData } = useQuery({
+    queryKey: ['overview-thinking'],
+    queryFn: () => fetch('/api/bot/thinking').then(r => r.json()),
+    refetchInterval: 30_000,
+    enabled: botData?.running,
+  })
+
   const price = data?.price
   const wave = data?.wave_summary
   const leadership = data?.leadership_summary
@@ -232,6 +245,40 @@ export default function Overview() {
         <div className="text-xs text-terminal-yellow/80 bg-terminal-yellow/5 border border-terminal-yellow/20 rounded px-3 py-2">
           {session.session_note}
         </div>
+      )}
+
+      {/* Bot Status Widget */}
+      {botData && (
+        <a href="/bot" className="block no-underline">
+          <div className={`rounded border p-3 flex items-center gap-4 text-sm cursor-pointer hover:border-green-600 transition-colors ${
+            botData.running ? 'border-green-800 bg-green-950/30' : 'border-terminal-border bg-terminal-card'
+          }`}>
+            <div className={`text-lg font-bold ${botData.running ? 'text-green-400' : 'text-gray-500'}`}>
+              {botData.running ? '● BOT LIVE' : '○ BOT STOPPED'}
+            </div>
+            <div className="flex gap-4 text-xs flex-wrap">
+              <span><span className="text-gray-400">Session </span><span className="text-white font-semibold">{botData.current_session || '—'}</span></span>
+              <span><span className="text-gray-400">Today </span><span className={`font-bold ${(botData.daily_pnl||0)>=0?'text-green-400':'text-red-400'}`}>${(botData.daily_pnl||0)>=0?'+':''}{(botData.daily_pnl||0).toFixed(0)}</span></span>
+              <span><span className="text-gray-400">Target </span><span className="text-yellow-400">${botData.daily_target||600}</span></span>
+              <span><span className="text-gray-400">Trades </span><span className="text-white">{botData.trades_today||0} ICT + {botData.scalp_today||0} scalps</span></span>
+              {botData.trail_mode && <span className="text-yellow-400 font-bold animate-pulse">⚡ TRAIL MODE — floor ${botData.trail_floor?.toFixed(0)}</span>}
+            </div>
+            {thinkData && (
+              <div className="flex gap-3 text-xs ml-auto flex-wrap">
+                {['MNQ','MES','MGC'].map(sym => {
+                  const t = thinkData.instruments?.[sym]
+                  if (!t) return null
+                  return (
+                    <div key={sym} className={`px-2 py-0.5 rounded border font-mono ${t.ready ? 'border-green-600 text-green-400' : 'border-gray-700 text-gray-500'}`}>
+                      {sym} {t.best_score}/{t.min_score}
+                      {t.scalp_ready && <span className="text-yellow-400 ml-1">⚡</span>}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        </a>
       )}
 
       {/* Bias Panel */}

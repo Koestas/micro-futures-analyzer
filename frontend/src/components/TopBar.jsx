@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch, fmt } from '../lib/api'
-import { RefreshCw, Circle, Zap } from 'lucide-react'
+import { RefreshCw, Circle, Zap, Bot } from 'lucide-react'
 import { clsx } from 'clsx'
 
 function MarketStatus() {
@@ -38,6 +38,20 @@ export default function TopBar() {
     queryKey: ['futures-prices'],
     queryFn: () => apiFetch('/api/market/futures'),
     refetchInterval: 30_000,
+  })
+
+  // Live ProjectX quotes — real-time, replaces Yahoo delayed futures prices
+  const { data: pxQuotes } = useQuery({
+    queryKey: ['topbar-px-quotes'],
+    queryFn: () => fetch('/api/projectx/quotes').then(r => r.json()),
+    refetchInterval: 5_000,   // every 5 seconds from WebSocket cache
+  })
+
+  // Bot status for top bar pill
+  const { data: botData } = useQuery({
+    queryKey: ['topbar-bot'],
+    queryFn: () => fetch('/api/bot/status').then(r => r.json()),
+    refetchInterval: 10_000,
   })
 
   const price = data?.price
@@ -122,19 +136,28 @@ export default function TopBar() {
 
       <div className="w-px h-6 bg-terminal-border shrink-0" />
 
-      {/* Futures: MNQ, MES, MGC */}
-      {futuresData && futuresData.map((f) => (
-        <div key={f.instrument} className="flex items-center gap-1 shrink-0">
-          <span className="text-terminal-muted">{f.instrument}</span>
-          <span className={`font-bold ${f.bullish ? 'text-terminal-green' : 'text-terminal-red'}`}>
-            {f.price != null ? fmt.num(Math.round(f.price)) : '--'}
-          </span>
-          <span className={f.bullish ? 'text-terminal-green' : 'text-terminal-red'}>
-            {fmt.pct(f.change_pct)}
-          </span>
-          <div className="w-px h-6 bg-terminal-border shrink-0 ml-2" />
-        </div>
-      ))}
+      {/* Futures: live from ProjectX WebSocket, fallback to Yahoo */}
+      {['MNQ', 'MES', 'MGC'].map(sym => {
+        const liveQ = pxQuotes?.quotes?.[sym]
+        const yahooF = futuresData?.find(f => f.instrument === sym)
+        const price = liveQ?.lastPrice ?? yahooF?.price
+        const chgPct = liveQ?.changePct ?? yahooF?.change_pct
+        const isLive = !!liveQ
+        const up = (chgPct || 0) >= 0
+        return (
+          <div key={sym} className="flex items-center gap-1 shrink-0">
+            <span className="text-terminal-muted text-xs">{sym}</span>
+            {isLive && <span className="text-green-500 text-xs">●</span>}
+            <span className={`font-bold text-sm ${up ? 'text-terminal-green' : 'text-terminal-red'}`}>
+              {price != null ? (sym === 'MGC' ? price.toFixed(1) : Math.round(price).toLocaleString()) : '--'}
+            </span>
+            <span className={`text-xs ${up ? 'text-terminal-green' : 'text-terminal-red'}`}>
+              {chgPct != null ? `${up ? '+' : ''}${chgPct.toFixed(2)}%` : ''}
+            </span>
+            <div className="w-px h-6 bg-terminal-border shrink-0 ml-1" />
+          </div>
+        )
+      })}
 
       {/* Regime */}
       <div className="flex items-center gap-1 shrink-0">
@@ -145,6 +168,19 @@ export default function TopBar() {
       </div>
 
       <div className="flex-1" />
+
+      {/* Bot status pill */}
+      {botData && (
+        <a href="/bot" className={clsx(
+          'flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold border shrink-0',
+          botData.running
+            ? 'bg-green-950 border-green-700 text-green-400'
+            : 'bg-terminal-card border-terminal-border text-gray-500'
+        )}>
+          <Bot size={10} />
+          {botData.running ? `BOT ● $${(botData.daily_pnl || 0) >= 0 ? '+' : ''}${(botData.daily_pnl || 0).toFixed(0)}` : 'BOT ○'}
+        </a>
+      )}
 
       {/* Status indicators */}
       <KillzoneIndicator />
