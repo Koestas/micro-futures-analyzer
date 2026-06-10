@@ -19,6 +19,7 @@ Position management:
 
 import asyncio
 import logging
+import os
 from datetime import datetime, date, timedelta
 from typing import Optional
 import pytz
@@ -504,7 +505,9 @@ def _news_clear(session_name: str) -> tuple[bool, str, int]:
 
 async def _sync_pnl():
     global _daily_pnl
-    trades = await px.get_trade_history(days_back=2)
+    # Always use the env-configured account so UI account-switching can't pollute the P&L
+    _env_aid = int(os.getenv("PROJECTX_ACCOUNT_ID", "0")) or None
+    trades = await px.get_trade_history(days_back=2, account_id=_env_aid)
     # Futures day starts at 6 PM ET — only count trades from this session's open
     now_et = datetime.now(NY_TZ)
     if now_et.hour >= 18:

@@ -31,9 +31,21 @@ export default function Bot() {
     refetchInterval: 10000,
   })
 
-  const startMut = useMutation({ mutationFn: () => fetch('/api/bot/start',     { method: 'POST' }).then(r => r.json()), onSuccess: () => qc.invalidateQueries(['bot-status']) })
-  const stopMut  = useMutation({ mutationFn: () => fetch('/api/bot/stop',      { method: 'POST' }).then(r => r.json()), onSuccess: () => qc.invalidateQueries(['bot-status']) })
-  const closeAll = useMutation({ mutationFn: () => fetch('/api/bot/close-all', { method: 'POST' }).then(r => r.json()), onSuccess: () => qc.invalidateQueries(['bot-status']) })
+  // Optimistic: flip running flag immediately in the cache so button responds instantly
+  const startMut = useMutation({
+    mutationFn: () => fetch('/api/bot/start', { method: 'POST' }).then(r => r.json()),
+    onMutate: () => qc.setQueryData(['bot-status'], old => old ? { ...old, running: true } : old),
+    onSettled: () => qc.invalidateQueries(['bot-status']),
+  })
+  const stopMut = useMutation({
+    mutationFn: () => fetch('/api/bot/stop', { method: 'POST' }).then(r => r.json()),
+    onMutate: () => qc.setQueryData(['bot-status'], old => old ? { ...old, running: false } : old),
+    onSettled: () => qc.invalidateQueries(['bot-status']),
+  })
+  const closeAll = useMutation({
+    mutationFn: () => fetch('/api/bot/close-all', { method: 'POST' }).then(r => r.json()),
+    onSettled: () => qc.invalidateQueries(['bot-status']),
+  })
 
   const { data: thinking } = useQuery({
     queryKey: ['bot-thinking'],
@@ -42,6 +54,7 @@ export default function Bot() {
   })
 
   const switchAccount = async (accountId) => {
+    qc.setQueryData(['bot-status'], old => old ? { ...old, account_id: accountId } : old)
     const r = await fetch(`/api/bot/switch-account?account_id=${accountId}`, { method: 'POST' }).then(x => x.json())
     setSwitchMsg(r.success ? `✓ Switched to ${r.name} ($${r.balance?.toLocaleString()})` : `✗ ${r.error}`)
     qc.invalidateQueries(['bot-status'])
@@ -73,10 +86,14 @@ export default function Bot() {
 
   const px = pxStatus.data
   const accounts = px?.accounts ?? []
-  const practiceAcct = accounts.find(a => a.name?.startsWith('PRAC'))
+  // Match account by the bot's actual account_id — not by name prefix (multiple PRAC accounts)
+  const botAccountId = data?.account_id
+  const practiceAcct = botAccountId
+    ? accounts.find(a => a.id === botAccountId)
+    : accounts.find(a => a.name?.startsWith('PRAC'))
   const pnlColor = pnl > 0 ? 'text-green-400' : pnl < 0 ? 'text-red-400' : 'text-gray-400'
 
-  // Account-derived session P&L (balance now minus balance at bot start) — ground truth
+  // Account-derived session P&L (balance now minus balance at bot start)
   const startBal  = data?.session_start_balance ?? 0
   const acctPnl   = startBal > 0 && practiceAcct ? practiceAcct.balance - startBal : null
   const acctColor = acctPnl === null ? 'text-gray-400' : acctPnl > 0 ? 'text-green-400' : acctPnl < 0 ? 'text-red-400' : 'text-gray-400'
