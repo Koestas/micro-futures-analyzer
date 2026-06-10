@@ -69,7 +69,7 @@ SESSIONS = [
         "instruments": ["MGC", "MNQ"],
         "start_et": (18, 0), "end_et": (21, 0),
         "wraps_midnight": False,
-        "min_score": 62, "contracts": 3, "max_trades": 1,
+        "min_score": 62, "contracts": 2, "max_trades": 1,
         "vol_regime_pct": 3.5, "sweep_max_age_mins": 240,
     },
     {   # Asia session — Gold prime time, NQ gets structure from US levels
@@ -77,7 +77,7 @@ SESSIONS = [
         "instruments": ["MGC", "MNQ"],
         "start_et": (21, 0), "end_et": (1, 0),
         "wraps_midnight": True,
-        "min_score": 58, "contracts": 5, "max_trades": 2,
+        "min_score": 58, "contracts": 2, "max_trades": 2,
         "vol_regime_pct": 2.5, "sweep_max_age_mins": 300,
     },
     {   # Asia–London handoff — NQ/MES taking over, Gold done for the night
@@ -85,7 +85,7 @@ SESSIONS = [
         "instruments": ["MNQ", "MES"],
         "start_et": (1, 0), "end_et": (3, 0),
         "wraps_midnight": False,
-        "min_score": 60, "contracts": 4, "max_trades": 1,
+        "min_score": 60, "contracts": 2, "max_trades": 1,
         "vol_regime_pct": 3.0, "sweep_max_age_mins": 240,
     },
     {   # London open — NQ/ES at their most predictable overnight
@@ -93,7 +93,7 @@ SESSIONS = [
         "instruments": ["MNQ", "MES"],
         "start_et": (3, 0), "end_et": (5, 0),
         "wraps_midnight": False,
-        "min_score": 62, "contracts": 5, "max_trades": 2,
+        "min_score": 62, "contracts": 2, "max_trades": 2,
         "vol_regime_pct": 4.0, "sweep_max_age_mins": 180,
     },
     {   # Pre-market — London close to NY open, decent volume building
@@ -101,7 +101,7 @@ SESSIONS = [
         "instruments": ["MNQ", "MES"],
         "start_et": (5, 0), "end_et": (9, 30),
         "wraps_midnight": False,
-        "min_score": 64, "contracts": 4, "max_trades": 1,
+        "min_score": 64, "contracts": 2, "max_trades": 1,
         "vol_regime_pct": 3.5, "sweep_max_age_mins": 300,
     },
     {   # NY AM killzone — highest quality, prime session
@@ -109,7 +109,7 @@ SESSIONS = [
         "instruments": ["MNQ", "MES"],
         "start_et": (9, 30), "end_et": (11, 30),
         "wraps_midnight": False,
-        "min_score": 65, "contracts": 5, "max_trades": 2,
+        "min_score": 65, "contracts": 3, "max_trades": 2,
         "vol_regime_pct": 4.0, "sweep_max_age_mins": 90,
     },
     {   # Midday lull — lower quality, smaller size, high bar
@@ -117,7 +117,7 @@ SESSIONS = [
         "instruments": ["MNQ"],
         "start_et": (11, 30), "end_et": (13, 30),
         "wraps_midnight": False,
-        "min_score": 70, "contracts": 3, "max_trades": 1,
+        "min_score": 70, "contracts": 1, "max_trades": 1,
         "vol_regime_pct": 3.5, "sweep_max_age_mins": 300,
     },
     {   # NY PM — strong momentum setups into close
@@ -125,7 +125,7 @@ SESSIONS = [
         "instruments": ["MNQ", "MES"],
         "start_et": (13, 30), "end_et": (15, 50),
         "wraps_midnight": False,
-        "min_score": 67, "contracts": 5, "max_trades": 2,
+        "min_score": 67, "contracts": 3, "max_trades": 2,
         "vol_regime_pct": 4.0, "sweep_max_age_mins": 330,
     },
 ]
