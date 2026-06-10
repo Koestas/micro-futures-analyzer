@@ -660,7 +660,9 @@ def _analyze(bars: list, instrument: str, session: dict) -> tuple[Optional[dict]
     vwap = _calc_vwap_at(bars, now_et)
 
     # Collect ICT signal components for learning
-    ict_sig = analysis.get("long_setup" if best_dir == "bullish" else "short_setup", {})
+    ict_sig  = analysis.get("long_setup" if best_dir == "bullish" else "short_setup", {}) or {}
+    obs_list = analysis.get("order_blocks") or []
+    ob_type  = "bullish_ob" if best_dir == "bullish" else "bearish_ob"
     sig_data = {
         "score":          round(best_sc),
         "direction":      best_dir,
@@ -668,12 +670,12 @@ def _analyze(bars: list, instrument: str, session: dict) -> tuple[Optional[dict]
         "rsi":            round(rsi, 1),
         "vwap":           round(vwap, 2) if vwap else None,
         "instrument":     instrument,
-        "sweep_detected": bool(analysis.get("sweeps")),
-        "sweep_quality":  (analysis.get("sweeps") or [{}])[-1].get("quality") if analysis.get("sweeps") else None,
+        "sweep_detected": False,
+        "sweep_quality":  None,
         "ifvg_present":   bool(analysis.get("ifvgs")),
-        "fvg_present":    bool(analysis.get("fvgs")),
-        "ob_present":     bool((analysis.get("order_blocks") or {}).get("bullish" if best_dir == "bullish" else "bearish")),
-        "mss_detected":   bool((analysis.get("mss_choch") or {}).get("latest_type")),
+        "fvg_present":    bool(analysis.get("fair_value_gaps")),
+        "ob_present":     any(o.get("type") == ob_type for o in obs_list),
+        "mss_detected":   False,
         "displacement":   ict_sig.get("displacement"),
     }
 
@@ -812,11 +814,11 @@ async def _find_stop_order_id(account_id: int, contract_id: str) -> Optional[int
 
 
 async def _monitor_positions():
-    """Runs every 30s — manages partial closes and trailing stops."""
+    """Runs every 10s — manages partial closes and trailing stops."""
     global _active_trade, _trail_mode, _trail_floor, _trail_locked_pnl, _daily_pnl
 
     while _running:
-        await asyncio.sleep(30)
+        await asyncio.sleep(10)
         if not _active_trade or not _running:
             continue
 
@@ -974,6 +976,7 @@ async def _monitor_positions():
 async def _loop():
     global _running, _last_signal, _current_session_name, _last_check
     global _daily_pnl, _trades_today, _trail_mode, _trail_floor
+    global _daily_floor, _daily_size_factor, _scalp_today, _eod_sent
 
     _log("Auto-trader started ✓  |  Target $800/day  |  22-hr coverage")
     asyncio.create_task(tg.alert_bot_started())
@@ -1039,18 +1042,18 @@ async def _loop():
 
             if not session:
                 _log("Between sessions — waiting")
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
                 continue
 
             sess_count = _session_trades.get(session["name"], 0)
             if sess_count >= session["max_trades"]:
-                await asyncio.sleep(120)
+                await asyncio.sleep(60)
                 continue
 
             # Already in a position? Monitor handles it, just wait
             positions = await px.get_positions()
             if positions:
-                await asyncio.sleep(45)
+                await asyncio.sleep(15)
                 continue
 
             # News filter — skip if high-impact USD event within 30 min
@@ -1058,7 +1061,7 @@ async def _loop():
             if not news_clear:
                 _log(f"NEWS BLOCK: {news_event} in {news_mins}min — skipping scan", "warning")
                 asyncio.create_task(tg.alert_news_block(news_event, news_mins, session["name"]))
-                await asyncio.sleep(300)
+                await asyncio.sleep(60)
                 continue
 
             # Scan all instruments — collect candidates, pick highest score (correlation filter)
@@ -1230,7 +1233,7 @@ async def _loop():
             _last_signal = setup or {"session": session["name"],
                                      "timestamp": now_et.isoformat(), "result": "no setup"}
             if not setup:
-                await asyncio.sleep(60)
+                await asyncio.sleep(15)
                 continue
 
             _log(
@@ -1364,17 +1367,18 @@ async def _loop():
                     }))
                 except Exception as je:
                     _log(f"Journal write failed: {je}", "error")
-                await asyncio.sleep(90)  # wait before next scan
+                await asyncio.sleep(45)  # brief wait after order before next scan
             else:
                 err = result.get("errorMessage", "unknown")
                 _log(f"ORDER REJECTED: {err}", "error")
-                await asyncio.sleep(60)
+                await asyncio.sleep(15)
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            _log(f"Loop error: {e}", "error")
-            await asyncio.sleep(30)
+            import traceback as _tb
+            _log(f"Loop error: {e} | {_tb.format_exc().splitlines()[-2]}", "error")
+            await asyncio.sleep(10)
 
     _log("Auto-trader stopped")
     asyncio.create_task(tg.alert_bot_stopped())
