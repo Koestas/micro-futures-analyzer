@@ -135,6 +135,7 @@ SESSIONS = [
 _running               = False
 _task                  = None
 _monitor_task          = None
+_ghost_task            = None
 _trade_log             : list = []
 _bot_log               : list = []
 _daily_pnl             : float = 0.0
@@ -634,9 +635,13 @@ def _is_daily_halted() -> tuple[bool, str]:
 
 # ─── Setup analysis ───────────────────────────────────────────────────────────
 
-def _analyze(bars: list, instrument: str, session: dict) -> Optional[dict]:
+def _analyze(bars: list, instrument: str, session: dict) -> tuple[Optional[dict], dict]:
+    """Returns (setup_or_none, signal_data).
+    signal_data is always populated for learning logging even when setup is None."""
+    _empty_sig = {"score": 0, "direction": None, "adx": 0, "rsi": 50, "vwap": None, "instrument": instrument}
+
     if len(bars) < 30:
-        return None
+        return None, _empty_sig
 
     recent   = bars[-150:]
     last_bar = bars[-1]
@@ -646,42 +651,59 @@ def _analyze(bars: list, instrument: str, session: dict) -> Optional[dict]:
     analysis = get_ict_analysis(recent, current_price=price)
     long_sc  = analysis.get("long_setup",  {}).get("score", 0) or 0
     short_sc = analysis.get("short_setup", {}).get("score", 0) or 0
+    best_dir = "bullish" if long_sc >= short_sc else "bearish"
+    best_sc  = max(long_sc, short_sc)
 
-    if max(long_sc, short_sc) < session["min_score"]:
-        return None
-
-    direction = "bullish" if long_sc >= short_sc else "bearish"
-    score     = long_sc if direction == "bullish" else short_sc
-
-    # ADX: trending market required
-    adx = _calc_adx(recent[-60:])
-    if adx < 10:
-        return None
-
-    # RSI: don't chase extremes
-    rsi = _calc_rsi(recent[-60:])
-    if direction == "bullish" and rsi > 80:
-        return None
-    if direction == "bearish" and rsi < 20:
-        return None
-
-    # VWAP filter (wider tolerance for off-hours)
+    adx  = _calc_adx(recent[-60:])
+    rsi  = _calc_rsi(recent[-60:])
     now_et = _bar_dt(last_bar)
-    vwap   = _calc_vwap_at(bars, now_et)
-    tol    = 0.005 if instrument == "MGC" else 0.004
+    vwap = _calc_vwap_at(bars, now_et)
+
+    # Collect ICT signal components for learning
+    ict_sig = analysis.get("long_setup" if best_dir == "bullish" else "short_setup", {})
+    sig_data = {
+        "score":          round(best_sc),
+        "direction":      best_dir,
+        "adx":            round(adx, 1),
+        "rsi":            round(rsi, 1),
+        "vwap":           round(vwap, 2) if vwap else None,
+        "instrument":     instrument,
+        "sweep_detected": bool(analysis.get("sweeps")),
+        "sweep_quality":  (analysis.get("sweeps") or [{}])[-1].get("quality") if analysis.get("sweeps") else None,
+        "ifvg_present":   bool(analysis.get("ifvgs")),
+        "fvg_present":    bool(analysis.get("fvgs")),
+        "ob_present":     bool((analysis.get("order_blocks") or {}).get("bullish" if best_dir == "bullish" else "bearish")),
+        "mss_detected":   bool((analysis.get("mss_choch") or {}).get("latest_type")),
+        "displacement":   ict_sig.get("displacement"),
+    }
+
+    if best_sc < session["min_score"]:
+        return None, {**sig_data, "skip_reason": "score_low"}
+
+    direction = best_dir
+    score     = best_sc
+
+    if adx < 10:
+        return None, {**sig_data, "skip_reason": "adx_low"}
+
+    if direction == "bullish" and rsi > 80:
+        return None, {**sig_data, "skip_reason": "rsi_extreme"}
+    if direction == "bearish" and rsi < 20:
+        return None, {**sig_data, "skip_reason": "rsi_extreme"}
+
+    tol = 0.005 if instrument == "MGC" else 0.004
     if vwap:
         if direction == "bullish" and price < vwap * (1 - tol):
-            return None
+            return None, {**sig_data, "skip_reason": "vwap_filter"}
         if direction == "bearish" and price > vwap * (1 + tol):
-            return None
+            return None, {**sig_data, "skip_reason": "vwap_filter"}
 
-    # 200 SMA
     sma = _calc_sma(recent, 200)
     if sma:
         if direction == "bullish" and price < sma * 0.994:
-            return None
+            return None, {**sig_data, "skip_reason": "sma_filter"}
         if direction == "bearish" and price > sma * 1.006:
-            return None
+            return None, {**sig_data, "skip_reason": "sma_filter"}
 
     # Stop & target
     atr       = _calc_atr(recent[-20:])
@@ -689,21 +711,22 @@ def _analyze(bars: list, instrument: str, session: dict) -> Optional[dict]:
     caps      = {"MNQ": 120, "MES": 60, "MGC": 20}
     stop_dist = min(stop_dist, caps.get(instrument, 120))
 
-    tick        = config["tick_size"]
-    stop_ticks  = max(1, round(stop_dist / tick))
+    tick       = config["tick_size"]
+    stop_ticks = max(1, round(stop_dist / tick))
+    side       = 0 if direction == "bullish" else 1
 
-    side = 0 if direction == "bullish" else 1
-
-    # In trail mode, use half contracts to preserve gains but keep compounding
-    contracts = session["contracts"]
-    if _trail_mode:
-        contracts = max(2, contracts // 2)
-    contracts = min(contracts, config["max_contracts"])
-
+    # Volatility-adjusted sizing: target ~$80 risk per contract
     usd_per_pt  = config["dollars_per_point"]
-    usd_risk    = stop_dist * usd_per_pt * contracts
-    usd_1r      = usd_risk  # profit at 1R = same as risk
-    usd_2r      = usd_risk * 2
+    TARGET_RISK = 80.0
+    vol_cts = max(1, round(TARGET_RISK / max(stop_dist * usd_per_pt, 1)))
+    # Blend with session contracts (vol floor, session ceiling)
+    contracts = min(max(vol_cts, 1), session["contracts"], config["max_contracts"])
+    if _trail_mode:
+        contracts = max(1, contracts // 2)
+
+    usd_risk = stop_dist * usd_per_pt * contracts
+    usd_1r   = usd_risk
+    usd_2r   = usd_risk * 2
 
     if direction == "bullish":
         sl_price = price - stop_dist
@@ -732,10 +755,52 @@ def _analyze(bars: list, instrument: str, session: dict) -> Optional[dict]:
         "session":      session["name"],
         "timestamp":    datetime.now(NY_TZ).isoformat(),
         "config":       config,
-    }
+    }, sig_data
 
 
 # ─── Position monitoring (partial close + trailing) ──────────────────────────
+
+def _log_trade_outcome(trade: dict, exit_price: float, outcome: str, float_pnl: float):
+    """Write completed trade outcome to the learning DB."""
+    try:
+        import engines.learning as _lrn
+        opened = trade.get("opened_at") or datetime.now(NY_TZ).isoformat()
+        try:
+            dur = int((datetime.fromisoformat(datetime.now(NY_TZ).isoformat()) -
+                       datetime.fromisoformat(opened)).total_seconds() / 60)
+        except Exception:
+            dur = 0
+        cfg = trade.get("config") or {}
+        trade_ref = trade.get("trade_ref") or f"unknown_{datetime.now(NY_TZ).strftime('%H%M%S')}"
+        _lrn.log_outcome(
+            eval_id=trade.get("eval_id"),
+            trade_ref=trade_ref,
+            instrument=trade.get("symbol", ""),
+            session=trade.get("session", ""),
+            direction=trade.get("direction", ""),
+            score=trade.get("score", 0),
+            contracts=trade.get("remaining_contracts", trade.get("total_contracts", 1)),
+            entry_price=trade.get("entry_price", 0),
+            exit_price=exit_price,
+            outcome=outcome,
+            pnl=round(float_pnl, 2),
+            duration_mins=dur,
+            max_adverse_excursion=trade.get("mae", 0.0),
+            max_favorable_excursion=trade.get("mfe", 0.0),
+            adx_at_entry=trade.get("adx"),
+            rsi_at_entry=trade.get("rsi"),
+            atr_at_entry=trade.get("atr"),
+            vwap_position=None,
+            htf_bias=trade.get("htf_direction"),
+            opened_at=opened,
+        )
+        # Send Telegram rating prompt
+        asyncio.create_task(tg.alert_trade_rating_prompt(
+            trade_ref, trade.get("symbol",""), trade.get("direction",""), float_pnl
+        ))
+    except Exception as e:
+        logger.warning(f"_log_trade_outcome error: {e}")
+
 
 async def _find_stop_order_id(account_id: int, contract_id: str) -> Optional[int]:
     """Find the stop-loss bracket order ID for an open position."""
@@ -773,12 +838,14 @@ async def _monitor_positions():
             positions = await px.get_positions()
             if not positions:
                 _log(f"Position closed — trade complete")
-                trade_sym = _active_trade.get("symbol", sym)
-                trade_dir = _active_trade.get("direction", "bullish")
-                trade_sess = _active_trade.get("session", "")
+                closed_trade = dict(_active_trade)
                 _active_trade = {}
                 await _sync_pnl()
-                asyncio.create_task(tg.alert_trade_closed(trade_sym, trade_dir, 0, _daily_pnl, trade_sess))
+                asyncio.create_task(tg.alert_trade_closed(
+                    closed_trade.get("symbol", sym), closed_trade.get("direction",""),
+                    0, _daily_pnl, closed_trade.get("session","")
+                ))
+                _log_trade_outcome(closed_trade, closed_trade.get("entry_price", 0), "manual", 0)
                 continue
 
             pos = next((p for p in positions if sym in (p.get("symbol", ""), p.get("contractId", ""))), None)
@@ -795,8 +862,17 @@ async def _monitor_positions():
             # Floating P&L on remaining contracts
             if side == 0:   # long
                 float_pnl = (cur_price - entry) * usd_pt * rem_ct
+                adverse   = max(0.0, entry - cur_price)
+                favorable = max(0.0, cur_price - entry)
             else:           # short
                 float_pnl = (entry - cur_price) * usd_pt * rem_ct
+                adverse   = max(0.0, cur_price - entry)
+                favorable = max(0.0, entry - cur_price)
+
+            # Track MAE/MFE in points
+            if "mae" in _active_trade:
+                _active_trade["mae"] = max(_active_trade["mae"], adverse)
+                _active_trade["mfe"] = max(_active_trade["mfe"], favorable)
 
             # ── Hard stop loss ────────────────────────────────────────────
             sl_price = _active_trade.get("stop_price")
@@ -806,9 +882,11 @@ async def _monitor_positions():
                 if hit_sl:
                     _log(f"SL HIT — closing {sym} @ {cur_price:.2f} (SL={sl_price:.2f})", "error")
                     await px.close_position(sym)
+                    closed_trade = dict(_active_trade)
                     _active_trade = {}
                     await _sync_pnl()
-                    asyncio.create_task(tg.alert_trade_closed(sym, _active_trade.get("direction",""), float_pnl, _daily_pnl, _active_trade.get("session","")))
+                    asyncio.create_task(tg.alert_trade_closed(sym, closed_trade.get("direction",""), float_pnl, _daily_pnl, closed_trade.get("session","")))
+                    _log_trade_outcome(closed_trade, cur_price, "sl_hit", float_pnl)
                     continue
 
             # ── Take profit at 2R ─────────────────────────────────────────
@@ -820,9 +898,11 @@ async def _monitor_positions():
             if hit_tp:
                 _log(f"TP HIT — closing {sym} @ {cur_price:.2f} (TP={tp_price:.2f})", "warning")
                 await px.close_position(sym)
+                closed_trade = dict(_active_trade)
                 _active_trade = {}
                 await _sync_pnl()
-                asyncio.create_task(tg.alert_trade_closed(sym, _active_trade.get("direction",""), float_pnl, _daily_pnl, _active_trade.get("session","")))
+                asyncio.create_task(tg.alert_trade_closed(sym, closed_trade.get("direction",""), float_pnl, _daily_pnl, closed_trade.get("session","")))
+                _log_trade_outcome(closed_trade, cur_price, "tp_hit", float_pnl)
                 continue
 
             # ── Partial close at +1R ──────────────────────────────────────
@@ -981,10 +1061,9 @@ async def _loop():
                 await asyncio.sleep(300)
                 continue
 
-            # Scan instruments
-            setup = None
+            # Scan all instruments — collect candidates, pick highest score (correlation filter)
+            all_candidates: list[tuple] = []  # (candidate, sig_data, htf_dir, instrument)
             for instrument in session["instruments"]:
-                # ── 15m trend confirmation ────────────────────────────────
                 try:
                     bars_15m = await px.get_bars(instrument, interval="15m", limit=30)
                     if bars_15m:
@@ -993,8 +1072,11 @@ async def _loop():
                         closes_15m = [b["close"] for b in bars_15m[-10:]]
                         sma_15m = sum(closes_15m) / len(closes_15m) if closes_15m else None
                         last_close_15m = bars_15m[-1]["close"] if bars_15m else None
+                    else:
+                        sma_15m = last_close_15m = None
                 except Exception:
                     sma_15m = last_close_15m = None
+
                 bar_data = await _bars(instrument)
                 if not bar_data:
                     continue
@@ -1002,50 +1084,148 @@ async def _loop():
                 if not _vol_ok(bar_data, session.get("vol_regime_pct", 4.0)):
                     continue
 
-                daily = await _daily_bars(instrument)
-                htf   = get_htf_bias(daily) if daily else {}
+                daily   = await _daily_bars(instrument)
+                htf     = get_htf_bias(daily) if daily else {}
                 htf_dir = htf.get("direction", "neutral")
 
-                candidate = _analyze(bar_data, instrument, session)
+                candidate, sig_data = _analyze(bar_data, instrument, session)
                 if not candidate:
-                    _log(f"{session['name']} | {instrument}: no setup (HTF={htf_dir}, score<{session['min_score']})")
+                    reason = sig_data.get("skip_reason", "no_setup")
+                    _log(f"{session['name']} | {instrument}: skip ({reason}, HTF={htf_dir})")
+                    # Log below-threshold evaluations as ghost trades when score was close
+                    if sig_data.get("score", 0) >= session["min_score"] - 8:
+                        try:
+                            import engines.learning as _lrn
+                            _lrn.log_evaluation(
+                                instrument=instrument, session=session["name"],
+                                direction=sig_data.get("direction") or "bullish",
+                                score=sig_data.get("score", 0),
+                                min_score_required=session["min_score"],
+                                traded=False, skip_reason=reason,
+                                price=sig_data.get("price"), atr=sig_data.get("atr"),
+                                adx=sig_data.get("adx"), rsi=sig_data.get("rsi"),
+                                vwap=sig_data.get("vwap"), htf_bias=htf_dir,
+                                sweep_detected=sig_data.get("sweep_detected", False),
+                                sweep_quality=sig_data.get("sweep_quality"),
+                                ifvg_present=sig_data.get("ifvg_present", False),
+                                fvg_present=sig_data.get("fvg_present", False),
+                                ob_present=sig_data.get("ob_present", False),
+                                mss_detected=sig_data.get("mss_detected", False),
+                                displacement=sig_data.get("displacement"),
+                            )
+                        except Exception:
+                            pass
                     continue
 
-                # HTF alignment
                 d = candidate["direction"]
+
+                # HTF alignment check
                 if htf_dir in ("strong_bullish","bullish","bullish_lean") and d == "bearish":
                     _log(f"{instrument}: contra HTF {htf_dir} — skip")
+                    try:
+                        import engines.learning as _lrn
+                        _lrn.log_evaluation(
+                            instrument=instrument, session=session["name"],
+                            direction=d, score=candidate["score"],
+                            min_score_required=session["min_score"],
+                            traded=False, skip_reason="htf_contra",
+                            price=candidate["entry_price"], atr=candidate["atr"],
+                            adx=candidate["adx"], rsi=candidate["rsi"],
+                            vwap=sig_data.get("vwap"), htf_bias=htf_dir,
+                            sweep_detected=sig_data.get("sweep_detected", False),
+                            sweep_quality=sig_data.get("sweep_quality"),
+                            ifvg_present=sig_data.get("ifvg_present", False),
+                            fvg_present=sig_data.get("fvg_present", False),
+                            ob_present=sig_data.get("ob_present", False),
+                            mss_detected=sig_data.get("mss_detected", False),
+                            ghost_entry=candidate["entry_price"],
+                            ghost_sl=candidate["sl_price"],
+                            ghost_tp=candidate["tp_price"],
+                            ghost_stop_ticks=candidate["stop_ticks"],
+                        )
+                    except Exception:
+                        pass
                     continue
                 if htf_dir in ("strong_bearish","bearish","bearish_lean") and d == "bullish":
                     _log(f"{instrument}: contra HTF {htf_dir} — skip")
+                    try:
+                        import engines.learning as _lrn
+                        _lrn.log_evaluation(
+                            instrument=instrument, session=session["name"],
+                            direction=d, score=candidate["score"],
+                            min_score_required=session["min_score"],
+                            traded=False, skip_reason="htf_contra",
+                            price=candidate["entry_price"], atr=candidate["atr"],
+                            adx=candidate["adx"], rsi=candidate["rsi"],
+                            vwap=sig_data.get("vwap"), htf_bias=htf_dir,
+                            sweep_detected=sig_data.get("sweep_detected", False),
+                            sweep_quality=sig_data.get("sweep_quality"),
+                            ifvg_present=sig_data.get("ifvg_present", False),
+                            fvg_present=sig_data.get("fvg_present", False),
+                            ob_present=sig_data.get("ob_present", False),
+                            mss_detected=sig_data.get("mss_detected", False),
+                            ghost_entry=candidate["entry_price"],
+                            ghost_sl=candidate["sl_price"],
+                            ghost_tp=candidate["tp_price"],
+                            ghost_stop_ticks=candidate["stop_ticks"],
+                        )
+                    except Exception:
+                        pass
                     continue
 
-                # 15m confirmation: price should be on the right side of 15m SMA
+                # 15m confirmation
                 if sma_15m and last_close_15m:
                     if d == "bullish" and last_close_15m < sma_15m * 0.997:
-                        _log(f"{instrument}: 15m below SMA ({last_close_15m:.2f} < {sma_15m:.2f}) — skip long")
+                        _log(f"{instrument}: 15m below SMA — skip long")
                         continue
                     if d == "bearish" and last_close_15m > sma_15m * 1.003:
-                        _log(f"{instrument}: 15m above SMA ({last_close_15m:.2f} > {sma_15m:.2f}) — skip short")
+                        _log(f"{instrument}: 15m above SMA — skip short")
                         continue
 
-                # Apply daily size factor — reduce contracts as profits lock in
+                # Apply daily size factor
                 raw_cts = candidate["contracts"]
                 scaled  = max(1, round(raw_cts * _daily_size_factor))
                 if scaled != raw_cts:
                     candidate["contracts"] = scaled
-                    config = _INSTRUMENT_CONFIG.get(instrument.upper(), _INSTRUMENT_CONFIG["MNQ"])
-                    candidate["usd_risk"] = round(candidate["stop_dist"] * config["dollars_per_point"] * scaled, 2)
+                    cfg2 = _INSTRUMENT_CONFIG.get(instrument.upper(), _INSTRUMENT_CONFIG["MNQ"])
+                    candidate["usd_risk"] = round(candidate["stop_dist"] * cfg2["dollars_per_point"] * scaled, 2)
 
                 candidate["htf_direction"] = htf_dir
-                setup = candidate
+                all_candidates.append((candidate, sig_data, htf_dir, instrument))
+
+            # Correlation filter: if multiple instruments pass, pick the highest score
+            # (avoids taking correlated long MNQ + long MES simultaneously)
+            setup = None
+            if all_candidates:
+                all_candidates.sort(key=lambda x: x[0]["score"], reverse=True)
+                best_cand, best_sig, best_htf, best_inst = all_candidates[0]
+                setup = best_cand
+                # Log skipped correlated instruments
+                for cand, sig, htf, inst in all_candidates[1:]:
+                    _log(f"{inst}: skipped — {best_inst} has higher score ({best_cand['score']} vs {cand['score']})")
+                    try:
+                        import engines.learning as _lrn
+                        _lrn.log_evaluation(
+                            instrument=inst, session=session["name"],
+                            direction=cand["direction"], score=cand["score"],
+                            min_score_required=session["min_score"],
+                            traded=False, skip_reason="correlation",
+                            price=cand["entry_price"], atr=cand["atr"],
+                            adx=cand["adx"], rsi=cand["rsi"],
+                            vwap=sig.get("vwap"), htf_bias=htf,
+                            ghost_entry=cand["entry_price"],
+                            ghost_sl=cand["sl_price"],
+                            ghost_tp=cand["tp_price"],
+                            ghost_stop_ticks=cand["stop_ticks"],
+                        )
+                    except Exception:
+                        pass
                 _log(
-                    f"✓ {session['name']} | {instrument} {d.upper()} "
-                    f"score={candidate['score']} ADX={candidate['adx']} RSI={candidate['rsi']} "
-                    f"x{candidate['contracts']} risk=${candidate['usd_risk']:.0f} "
-                    f"HTF={htf_dir} | floor=${_daily_floor:.0f} size={_daily_size_factor:.0%}"
+                    f"✓ {session['name']} | {best_inst} {best_cand['direction'].upper()} "
+                    f"score={best_cand['score']} ADX={best_cand['adx']} RSI={best_cand['rsi']} "
+                    f"x{best_cand['contracts']} risk=${best_cand['usd_risk']:.0f} "
+                    f"HTF={best_htf} | floor=${_daily_floor:.0f} size={_daily_size_factor:.0%}"
                 )
-                break
 
             _last_signal = setup or {"session": session["name"],
                                      "timestamp": now_et.isoformat(), "result": "no setup"}
@@ -1071,9 +1251,35 @@ async def _loop():
             )
 
             if result.get("success"):
-                order_id = result.get("orderId")
+                order_id  = result.get("orderId")
+                trade_ref = f"{setup['instrument']}_{datetime.now(NY_TZ).strftime('%Y%m%d_%H%M%S')}"
                 _log(f"ORDER PLACED — ID {order_id}", "warning")
                 asyncio.create_task(tg.alert_trade_opened(setup))
+
+                # Log to learning DB
+                try:
+                    import engines.learning as _lrn
+                    _eval_id = _lrn.log_evaluation(
+                        instrument=setup["instrument"], session=session["name"],
+                        direction=setup["direction"], score=setup["score"],
+                        min_score_required=session["min_score"],
+                        traded=True,
+                        price=setup["entry_price"], atr=setup["atr"],
+                        adx=setup["adx"], rsi=setup["rsi"],
+                        vwap=best_sig.get("vwap") if all_candidates else None,
+                        htf_bias=setup.get("htf_direction"),
+                        sweep_detected=best_sig.get("sweep_detected", False) if all_candidates else False,
+                        sweep_quality=best_sig.get("sweep_quality") if all_candidates else None,
+                        ifvg_present=best_sig.get("ifvg_present", False) if all_candidates else False,
+                        fvg_present=best_sig.get("fvg_present", False) if all_candidates else False,
+                        ob_present=best_sig.get("ob_present", False) if all_candidates else False,
+                        mss_detected=best_sig.get("mss_detected", False) if all_candidates else False,
+                        displacement=setup.get("atr"),
+                        trade_ref=trade_ref,
+                    )
+                except Exception as _le:
+                    _eval_id = None
+                    _log(f"Learning log error: {_le}", "error")
 
                 # Mirror to additional accounts if configured
                 mirror_ids = px.get_mirror_account_ids()
@@ -1118,6 +1324,16 @@ async def _loop():
                     "usd_1r":              setup["usd_1r"],
                     "session":             session["name"],
                     "timestamp":           setup["timestamp"],
+                    # Learning tracking
+                    "eval_id":             _eval_id,
+                    "trade_ref":           trade_ref,
+                    "opened_at":           datetime.now(NY_TZ).isoformat(),
+                    "score":               setup["score"],
+                    "adx":                 setup["adx"],
+                    "rsi":                 setup["rsi"],
+                    "atr":                 setup["atr"],
+                    "mae":                 0.0,   # max adverse excursion (points)
+                    "mfe":                 0.0,   # max favorable excursion (points)
                 }
 
                 _trade_log.append({**setup, "order_id": order_id, "stop_order_id": stop_oid})
@@ -1167,9 +1383,16 @@ async def _loop():
 # ─── Start / Stop ─────────────────────────────────────────────────────────────
 
 async def start():
-    global _running, _task, _monitor_task, _scalp_task, _session_start_balance
+    global _running, _task, _monitor_task, _scalp_task, _session_start_balance, _ghost_task
     if _running:
         return False
+    # Init learning DB and start ghost tracker
+    try:
+        import engines.learning as _lrn
+        _lrn.init_db()
+        _ghost_task = asyncio.create_task(_lrn.ghost_tracker_loop())
+    except Exception as e:
+        logger.warning(f"Learning engine init failed: {e}")
     # Snapshot balance at session start so frontend can show true session P&L
     try:
         accounts = await px.get_accounts()
@@ -1181,16 +1404,22 @@ async def start():
     _task         = asyncio.create_task(_loop())
     _monitor_task = asyncio.create_task(_monitor_positions())
     _scalp_task   = asyncio.create_task(_scalp_loop())
+    # Poll Telegram for trade ratings every 60s
+    async def _rating_poll_loop():
+        while _running:
+            await asyncio.sleep(60)
+            await tg.poll_ratings()
+    asyncio.create_task(_rating_poll_loop())
     return True
 
 
 async def stop():
-    global _running, _task, _monitor_task, _scalp_task
+    global _running, _task, _monitor_task, _scalp_task, _ghost_task
     _running = False
-    for t in (_task, _monitor_task, _scalp_task):
+    for t in (_task, _monitor_task, _scalp_task, _ghost_task):
         if t:
             t.cancel()
-    _task = _monitor_task = _scalp_task = None
+    _task = _monitor_task = _scalp_task = _ghost_task = None
     return True
 
 

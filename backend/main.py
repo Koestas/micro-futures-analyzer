@@ -26,6 +26,7 @@ from routes.projectx import router as projectx_router
 from routes.autotrader import router as autotrader_router
 from routes.botstats import router as botstats_router
 from routes.scalp_backtest import router as scalp_bt_router
+from routes.analytics import router as analytics_router
 
 
 async def _background_refresh():
@@ -101,6 +102,7 @@ app.include_router(projectx_router)
 app.include_router(autotrader_router)
 app.include_router(botstats_router)
 app.include_router(scalp_bt_router)
+app.include_router(analytics_router)
 
 
 @app.exception_handler(Exception)

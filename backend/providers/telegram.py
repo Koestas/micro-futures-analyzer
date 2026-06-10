@@ -146,8 +146,68 @@ async def alert_daily_summary(pnl: float, trades: int, scalps: int, wins: int, l
 
 
 async def alert_bot_started():
-    await send("🤖 <b>MFA Bot started</b> — 22-hr coverage active\nTarget: $600/day | Limit: $1,000 loss")
+    await send("🤖 <b>MFA Bot started</b> — 22-hr coverage active\nTarget: $500+ | Limit: $1,000 loss")
 
 
 async def alert_bot_stopped():
     await send("⏹ <b>MFA Bot stopped</b>")
+
+
+async def alert_trade_rating_prompt(trade_ref: str, sym: str, direction: str, pnl: float):
+    """Send a rating prompt after a trade closes. User replies 👍/👎/skip."""
+    side = "LONG" if direction == "bullish" else "SHORT"
+    emoji = "✅" if pnl >= 0 else "❌"
+    await send(
+        f"{emoji} <b>Rate this trade</b> (helps the bot learn)\n"
+        f"{sym} {side}  P&amp;L: <b>${pnl:+.0f}</b>\n"
+        f"Reply <b>👍</b> good setup  |  <b>👎</b> bad setup  |  <b>skip</b>\n"
+        f"<code>ref:{trade_ref}</code>"
+    )
+
+
+# ── Rating reply poller ───────────────────────────────────────────────────────
+
+_last_update_id: int = 0
+
+
+async def poll_ratings():
+    """Background task — polls Telegram for rating replies and writes to learning DB.
+    Runs every 60s. Only processes messages containing 👍/👎 that quote a ref: tag."""
+    global _last_update_id
+    if not is_configured():
+        return
+    token, _ = _cfg()
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, params={"offset": _last_update_id + 1, "limit": 20})
+            data = resp.json()
+        updates = data.get("result", [])
+        for upd in updates:
+            _last_update_id = upd["update_id"]
+            msg = upd.get("message", {})
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            # Look for rating + ref tag in reply chain
+            reply = msg.get("reply_to_message", {})
+            ref_text = (reply.get("text") or "") + text
+            import re
+            ref_match = re.search(r"ref:(\S+)", ref_text)
+            if not ref_match:
+                continue
+            trade_ref = ref_match.group(1)
+            if "👍" in text:
+                rating = 1
+            elif "👎" in text:
+                rating = -1
+            else:
+                continue
+            try:
+                from engines.learning import set_user_rating
+                set_user_rating(trade_ref, rating)
+                await send(f"✓ Rating saved for <code>{trade_ref}</code>: {'👍 good' if rating == 1 else '👎 bad'}")
+            except Exception as e:
+                logger.warning(f"Rating save failed: {e}")
+    except Exception as e:
+        logger.warning(f"poll_ratings error: {e}")
