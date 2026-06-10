@@ -45,7 +45,7 @@ UTC   = pytz.UTC
 #   Min trading days: 5
 #   Consistency rule: no single day > 40% of total profit
 DAILY_MAX_LOSS      = 800.0    # $200 buffer — stop before TopstepX's $1k hard lock
-DAILY_MAX_PROFIT    = 400.0    # conservative daily cap — 8 days × $400 = $3,200 to pass
+DAILY_MAX_PROFIT    = 700.0    # 4-5 days × $700 = passes combine, stays within consistency rule
 COMBINE_PASS_HALT   = 2800.0   # cumulative P&L ceiling — STOP, force payout submission
 TRAIL_INCREMENT     = 50.0     # trail individual position stop every $50
 PARTIAL_RATIO       = 0.60     # close this fraction at +1R
@@ -57,10 +57,10 @@ MAX_DAILY_TRADES    = 6        # tighter cap on combine — quality over quantit
 #   $350 = one more trade max at minimum size
 #   $400 = done for the day, no exceptions
 PROFIT_LOCKS = [
-    (150,  150,  1.00),   # qualifying day locked in — protect it
-    (250,  250,  0.80),   # floor raised, size trimmed
-    (350,  350,  0.60),   # near daily cap — conservative runners only
-    (400,  400,  0.00),   # daily max — done, close app, go outside
+    (200,  200,  1.00),   # qualifying day floor locked in
+    (400,  400,  0.90),   # good day — protect it, slight size trim
+    (550,  550,  0.75),   # excellent day — reduce size, protect gains
+    (700,  700,  0.00),   # daily max — done, log off, go outside
 ]
 
 # Scalp layer — conservative on combine

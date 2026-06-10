@@ -86,7 +86,7 @@ export default function Bot() {
   const lastSig      = data?.last_signal ?? {}
   const dailyFloor     = data?.daily_floor ?? -1000
   const sizeFactor     = data?.daily_size_factor ?? 1.0
-  const dailyMaxProfit = data?.daily_max_profit ?? 400
+  const dailyMaxProfit = data?.daily_max_profit ?? 700
   const dailyMaxLoss   = data?.daily_max_loss ?? 800
   const combinePnl     = data?.combine_pnl ?? 0
   const combineTarget  = data?.combine_target ?? 2800
