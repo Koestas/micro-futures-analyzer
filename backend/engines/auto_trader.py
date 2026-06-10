@@ -421,7 +421,6 @@ async def _scalp_loop():
                     side=setup["side"],
                     size=setup["contracts"],
                     order_type=2,
-                    stop_loss_ticks=setup["stop_ticks"],
                 )
 
                 if result.get("success"):
@@ -904,7 +903,6 @@ async def _loop():
                 await asyncio.sleep(60)
                 continue
 
-            # ── Place order — SL bracket via API, TP managed by monitor ──
             _log(
                 f"PLACING: {setup['instrument']} {setup['direction'].upper()} "
                 f"x{setup['contracts']} @ {setup['entry_price']:.2f} | "
@@ -916,12 +914,11 @@ async def _loop():
                 side=setup["side"],
                 size=setup["contracts"],
                 order_type=2,
-                stop_loss_ticks=setup["stop_ticks"],
             )
 
             if result.get("success"):
                 order_id = result.get("orderId")
-                _log(f"ORDER PLACED — ID {order_id} | SL bracket {setup['stop_ticks']} ticks", "warning")
+                _log(f"ORDER PLACED — ID {order_id}", "warning")
                 asyncio.create_task(tg.alert_trade_opened(setup))
 
                 # Mirror to additional accounts if configured
@@ -933,7 +930,6 @@ async def _loop():
                             side=setup["side"],
                             size=setup["contracts"],
                             order_type=2,
-                            stop_loss_ticks=setup["stop_ticks"],
                             account_id=mirror_id,
                         )
                         if mr.get("success"):
