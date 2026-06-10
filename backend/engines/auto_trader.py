@@ -814,11 +814,11 @@ async def _find_stop_order_id(account_id: int, contract_id: str) -> Optional[int
 
 
 async def _monitor_positions():
-    """Runs every 10s — manages partial closes and trailing stops."""
+    """Runs every 5s — manages partial closes and trailing stops."""
     global _active_trade, _trail_mode, _trail_floor, _trail_locked_pnl, _daily_pnl
 
     while _running:
-        await asyncio.sleep(10)
+        await asyncio.sleep(5)
         if not _active_trade or not _running:
             continue
 
@@ -1041,19 +1041,18 @@ async def _loop():
             _current_session_name = session["name"] if session else "Between sessions"
 
             if not session:
-                _log("Between sessions — waiting")
-                await asyncio.sleep(30)
+                await asyncio.sleep(15)
                 continue
 
             sess_count = _session_trades.get(session["name"], 0)
             if sess_count >= session["max_trades"]:
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
                 continue
 
             # Already in a position? Monitor handles it, just wait
             positions = await px.get_positions()
             if positions:
-                await asyncio.sleep(15)
+                await asyncio.sleep(5)
                 continue
 
             # News filter — skip if high-impact USD event within 30 min
@@ -1061,7 +1060,7 @@ async def _loop():
             if not news_clear:
                 _log(f"NEWS BLOCK: {news_event} in {news_mins}min — skipping scan", "warning")
                 asyncio.create_task(tg.alert_news_block(news_event, news_mins, session["name"]))
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
                 continue
 
             # Scan all instruments — collect candidates, pick highest score (correlation filter)
@@ -1233,7 +1232,7 @@ async def _loop():
             _last_signal = setup or {"session": session["name"],
                                      "timestamp": now_et.isoformat(), "result": "no setup"}
             if not setup:
-                await asyncio.sleep(15)
+                await asyncio.sleep(5)
                 continue
 
             _log(
@@ -1371,14 +1370,14 @@ async def _loop():
             else:
                 err = result.get("errorMessage", "unknown")
                 _log(f"ORDER REJECTED: {err}", "error")
-                await asyncio.sleep(15)
+                await asyncio.sleep(5)
 
         except asyncio.CancelledError:
             break
         except Exception as e:
             import traceback as _tb
             _log(f"Loop error: {e} | {_tb.format_exc().splitlines()[-2]}", "error")
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
     _log("Auto-trader stopped")
     asyncio.create_task(tg.alert_bot_stopped())
