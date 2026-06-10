@@ -585,9 +585,8 @@ def _news_clear(session_name: str) -> tuple[bool, str, int]:
 
 async def _sync_pnl():
     global _daily_pnl
-    # Always use the env-configured account so UI account-switching can't pollute the P&L
-    _env_aid = int(os.getenv("PROJECTX_ACCOUNT_ID", "0")) or None
-    trades = await px.get_trade_history(days_back=2, account_id=_env_aid)
+    # Use the currently active account (px._account_id, set to the live PRAC account on startup)
+    trades = await px.get_trade_history(days_back=2, account_id=px._account_id)
     # Futures day starts at 6 PM ET — only count trades from this session's open
     now_et = datetime.now(NY_TZ)
     if now_et.hour >= 18:

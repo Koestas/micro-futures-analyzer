@@ -114,18 +114,25 @@ async def get_accounts() -> list:
             )
             data = resp.json()
             if data.get("success"):
-                _accounts = data.get("accounts", [])
+                all_accts = data.get("accounts", [])
+                # Only expose tradeable accounts — filters out dead practice and ineligible combines
+                _accounts = [a for a in all_accts if a.get("canTrade")]
                 if _account_id is None:
-                    # Prefer env-specified account, else first tradeable account
-                    preferred = os.getenv("PROJECTX_ACCOUNT_ID")
-                    if preferred:
-                        preferred_id = int(preferred)
-                        match = next((a for a in _accounts if a["id"] == preferred_id), None)
-                        if match:
-                            _account_id = preferred_id
-                    if _account_id is None:
-                        tradeable = [a for a in _accounts if a.get("canTrade")]
-                        _account_id = tradeable[0]["id"] if tradeable else (_accounts[0]["id"] if _accounts else None)
+                    # Priority 1: any active PRAC account (practice — always prefer over combine)
+                    prac = next((a for a in _accounts if "PRAC" in (a.get("name") or "").upper()), None)
+                    if prac:
+                        _account_id = prac["id"]
+                    else:
+                        # Priority 2: env-specified account if it's still tradeable
+                        preferred = os.getenv("PROJECTX_ACCOUNT_ID")
+                        if preferred:
+                            preferred_id = int(preferred)
+                            match = next((a for a in _accounts if a["id"] == preferred_id), None)
+                            if match:
+                                _account_id = preferred_id
+                        # Priority 3: first tradeable account
+                        if _account_id is None and _accounts:
+                            _account_id = _accounts[0]["id"]
                 return _accounts
     except Exception as e:
         logger.error(f"get_accounts: {e}")
