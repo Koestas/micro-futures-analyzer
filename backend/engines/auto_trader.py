@@ -122,12 +122,13 @@ SESSIONS = [
 
 # ─── State ──────────────────────────────────────────────────────────────────
 
-_running         = False
-_task            = None
-_monitor_task    = None
-_trade_log       : list = []
-_bot_log         : list = []
-_daily_pnl       : float = 0.0
+_running               = False
+_task                  = None
+_monitor_task          = None
+_trade_log             : list = []
+_bot_log               : list = []
+_daily_pnl             : float = 0.0
+_session_start_balance : float = 0.0
 _trades_today    : int = 0
 _session_trades  : dict = {}
 _last_signal     : dict = {}
@@ -171,9 +172,10 @@ def get_state() -> dict:
         "last_signal":     _last_signal,
         "current_session": _current_session_name,
         "last_check":      _last_check,
-        "active_trade":    _active_trade,
-        "trade_log":       _trade_log[-30:],
-        "bot_log":         _bot_log[-60:],
+        "active_trade":          _active_trade,
+        "trade_log":             _trade_log[-30:],
+        "bot_log":               _bot_log[-60:],
+        "session_start_balance": _session_start_balance,
     }
 
 
@@ -419,6 +421,7 @@ async def _scalp_loop():
                     side=setup["side"],
                     size=setup["contracts"],
                     order_type=2,
+                    stop_loss_ticks=setup["stop_ticks"],
                 )
 
                 if result.get("success"):
@@ -483,12 +486,13 @@ def _news_clear(session_name: str) -> tuple[bool, str, int]:
 
 async def _sync_pnl():
     global _daily_pnl
-    trades = await px.get_trade_history(days_back=1)
-    today  = str(date.today())
+    trades = await px.get_trade_history(days_back=2)
+    # 24h rolling window so cross-midnight futures sessions are captured correctly
+    cutoff = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M")
     _daily_pnl = round(sum(
         (t.get("profitAndLoss") or 0) - (t.get("fees") or 0)
         for t in trades
-        if t.get("creationTimestamp", "")[:10] == today
+        if t.get("creationTimestamp", "")[:16] >= cutoff
     ), 2)
 
 
@@ -900,7 +904,7 @@ async def _loop():
                 await asyncio.sleep(60)
                 continue
 
-            # ── Place order — stop bracket only, manage TP manually ──────
+            # ── Place order — SL bracket via API, TP managed by monitor ──
             _log(
                 f"PLACING: {setup['instrument']} {setup['direction'].upper()} "
                 f"x{setup['contracts']} @ {setup['entry_price']:.2f} | "
@@ -912,11 +916,12 @@ async def _loop():
                 side=setup["side"],
                 size=setup["contracts"],
                 order_type=2,
+                stop_loss_ticks=setup["stop_ticks"],
             )
 
             if result.get("success"):
                 order_id = result.get("orderId")
-                _log(f"ORDER PLACED — ID {order_id}", "warning")
+                _log(f"ORDER PLACED — ID {order_id} | SL bracket {setup['stop_ticks']} ticks", "warning")
                 asyncio.create_task(tg.alert_trade_opened(setup))
 
                 # Mirror to additional accounts if configured
@@ -928,6 +933,7 @@ async def _loop():
                             side=setup["side"],
                             size=setup["contracts"],
                             order_type=2,
+                            stop_loss_ticks=setup["stop_ticks"],
                             account_id=mirror_id,
                         )
                         if mr.get("success"):
@@ -1009,9 +1015,16 @@ async def _loop():
 # ─── Start / Stop ─────────────────────────────────────────────────────────────
 
 async def start():
-    global _running, _task, _monitor_task, _scalp_task
+    global _running, _task, _monitor_task, _scalp_task, _session_start_balance
     if _running:
         return False
+    # Snapshot balance at session start so frontend can show true session P&L
+    try:
+        accounts = await px.get_accounts()
+        primary = next((a for a in accounts if a.get("id") == px._account_id), accounts[0] if accounts else {})
+        _session_start_balance = float(primary.get("balance", 0))
+    except Exception:
+        _session_start_balance = 0.0
     _running      = True
     _task         = asyncio.create_task(_loop())
     _monitor_task = asyncio.create_task(_monitor_positions())

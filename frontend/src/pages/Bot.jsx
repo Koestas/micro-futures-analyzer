@@ -72,6 +72,11 @@ export default function Bot() {
   const practiceAcct = accounts.find(a => a.name?.startsWith('PRAC'))
   const pnlColor = pnl > 0 ? 'text-green-400' : pnl < 0 ? 'text-red-400' : 'text-gray-400'
 
+  // Account-derived session P&L (balance now minus balance at bot start) — ground truth
+  const startBal  = data?.session_start_balance ?? 0
+  const acctPnl   = startBal > 0 && practiceAcct ? practiceAcct.balance - startBal : null
+  const acctColor = acctPnl === null ? 'text-gray-400' : acctPnl > 0 ? 'text-green-400' : acctPnl < 0 ? 'text-red-400' : 'text-gray-400'
+
   return (
     <div className="p-4 space-y-4 max-w-7xl mx-auto">
 
@@ -105,7 +110,8 @@ export default function Bot() {
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
         <Stat label="Bot Status"    value={running ? '● LIVE' : '○ Stopped'} color={running ? 'text-green-400' : 'text-gray-500'} />
         <Stat label="Session"       value={session} />
-        <Stat label="Today P&L"     value={`$${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`} color={pnlColor} />
+        <Stat label="Bot P&L"       value={`$${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`} color={pnlColor} />
+        <Stat label="Account P&L"   value={acctPnl !== null ? `$${acctPnl >= 0 ? '+' : ''}${acctPnl.toFixed(2)}` : '—'} color={acctColor} />
         <Stat label="ICT Trades"    value={trades} />
         <Stat label="Scalps Today"  value={data?.scalp_today ?? 0} />
         <Stat label="Daily Target"  value={`$${data?.daily_target ?? 600}`} small />

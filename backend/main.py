@@ -1,9 +1,11 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 import asyncio
+import os
 import uvicorn
 
 load_dotenv()
@@ -44,28 +46,10 @@ async def _background_refresh():
         await asyncio.sleep(300)  # 5 minutes
 
 
-async def _codespace_keepalive():
-    """Self-ping every 90s so the Codespace VM never sleeps, even with browser closed.
-    The bot needs the server alive 24/7 to catch Asia/London sessions overnight."""
-    await asyncio.sleep(30)
-    while True:
-        try:
-            # Use asyncio transport directly to avoid an httpx import here
-            reader, writer = await asyncio.open_connection("127.0.0.1", 8000)
-            writer.write(b"GET /api/health HTTP/1.0\r\nHost: localhost\r\n\r\n")
-            await writer.drain()
-            await reader.read(256)
-            writer.close()
-        except Exception:
-            pass
-        await asyncio.sleep(90)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     yahoo_task     = asyncio.create_task(_background_refresh())
-    keepalive_task = asyncio.create_task(_codespace_keepalive())
 
     # ProjectX live data (non-blocking — logs warning if creds missing)
     import providers.projectx as px
@@ -82,7 +66,6 @@ async def lifespan(app: FastAPI):
 
     yield
     yahoo_task.cancel()
-    keepalive_task.cancel()
     px_task.cancel()
     bot_task.cancel()
     await at.stop()
@@ -130,5 +113,15 @@ async def health():
     return {"status": "ok", "version": "1.0.0"}
 
 
+# Serve the built React frontend — must come after all /api/* routes
+_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend", "dist")
+if os.path.isdir(_DIST):
+    app.mount("/assets", StaticFiles(directory=os.path.join(_DIST, "assets")), name="assets")
+
+    @app.get("/{_full_path:path}")
+    async def serve_spa(_full_path: str = ""):
+        return FileResponse(os.path.join(_DIST, "index.html"))
+
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
