@@ -46,6 +46,11 @@ export default function Bot() {
     mutationFn: () => fetch('/api/bot/close-all', { method: 'POST' }).then(r => r.json()),
     onSettled: () => qc.invalidateQueries(['bot-status']),
   })
+  const resetPnl = useMutation({
+    mutationFn: () => fetch('/api/bot/reset-pnl', { method: 'POST' }).then(r => r.json()),
+    onMutate: () => qc.setQueryData(['bot-status'], old => old ? { ...old, daily_pnl: 0, daily_floor: -1000, daily_size_factor: 1.0 } : old),
+    onSettled: () => qc.invalidateQueries(['bot-status']),
+  })
 
   const { data: thinking } = useQuery({
     queryKey: ['bot-thinking'],
@@ -120,6 +125,9 @@ export default function Bot() {
           }
           <button onClick={() => closeAll.mutate()} className="px-3 py-2 bg-orange-700 hover:bg-orange-600 text-white text-sm rounded">
             Close All
+          </button>
+          <button onClick={() => { if (window.confirm('Reset daily P&L to $0? Use this after resetting your account.')) resetPnl.mutate() }} className="px-3 py-2 bg-gray-700 hover:bg-gray-600 text-yellow-400 text-sm rounded">
+            Reset P&L
           </button>
           <a href="/scalp-backtest" className="px-3 py-2 bg-terminal-card border border-terminal-border text-gray-400 hover:text-white text-sm rounded">
             Backtest Results

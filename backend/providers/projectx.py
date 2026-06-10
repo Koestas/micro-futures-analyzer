@@ -116,7 +116,13 @@ async def get_accounts() -> list:
             if data.get("success"):
                 all_accts = data.get("accounts", [])
                 # Only expose tradeable accounts — filters out dead practice and ineligible combines
-                _accounts = [a for a in all_accts if a.get("canTrade")]
+                eligible = [a for a in all_accts if a.get("canTrade")]
+                # If an allowlist is configured, only show those accounts
+                allowed_env = os.getenv("PROJECTX_ALLOWED_ACCOUNTS", "")
+                if allowed_env:
+                    allowed_names = {n.strip() for n in allowed_env.split(",")}
+                    eligible = [a for a in eligible if a.get("name") in allowed_names]
+                _accounts = eligible
                 if _account_id is None:
                     # Priority 1: any active PRAC account (practice — always prefer over combine)
                     prac = next((a for a in _accounts if "PRAC" in (a.get("name") or "").upper()), None)

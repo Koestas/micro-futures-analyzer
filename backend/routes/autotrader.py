@@ -193,3 +193,10 @@ async def switch_account(account_id: int):
         "name":       match["name"],
         "balance":    match["balance"],
     }
+
+
+@router.post("/reset-pnl")
+async def reset_pnl():
+    """Reset daily P&L to zero — use after resetting an account or starting fresh."""
+    at.reset_daily_pnl()
+    return {"success": True, "message": "Daily P&L reset to $0"}

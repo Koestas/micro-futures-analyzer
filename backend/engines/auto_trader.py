@@ -1192,3 +1192,14 @@ async def stop():
             t.cancel()
     _task = _monitor_task = _scalp_task = None
     return True
+
+
+def reset_daily_pnl():
+    """Zero out the daily P&L counter — use after resetting/switching to a fresh account."""
+    global _daily_pnl, _daily_floor, _daily_size_factor, _trades_today, _session_trades
+    _daily_pnl        = 0.0
+    _daily_floor      = -DAILY_MAX_LOSS
+    _daily_size_factor = 1.0
+    _trades_today     = 0
+    _session_trades   = {}
+    _log("Daily P&L reset to 0 — fresh start ✓", "warning")
