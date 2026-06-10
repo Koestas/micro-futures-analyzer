@@ -1093,7 +1093,9 @@ async def _loop():
                 candidate, sig_data = _analyze(bar_data, instrument, session)
                 if not candidate:
                     reason = sig_data.get("skip_reason", "no_setup")
-                    _log(f"{session['name']} | {instrument}: skip ({reason}, HTF={htf_dir})")
+                    # Only log skips that are worth knowing about (not routine score_low noise)
+                    if reason not in ("score_low", "no_setup"):
+                        _log(f"{session['name']} | {instrument}: skip ({reason}, HTF={htf_dir})")
                     # Log below-threshold evaluations as ghost trades when score was close
                     if sig_data.get("score", 0) >= session["min_score"] - 8:
                         try:
