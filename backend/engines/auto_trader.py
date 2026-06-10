@@ -1,19 +1,20 @@
-"""Live ICT auto-trader — ProjectX/TopstepX practice account.
+"""Live ICT auto-trader — ProjectX/TopstepX.
 
 Trading window: 6:15 PM – 3:50 PM ET (all CME hours, skip 4–6 PM close).
 8 sessions cover the full window; instruments and score floors vary by session quality.
 
-$800/day target:
-  • When realized P&L crosses $800: enter trail mode
-  • In trail mode: partial close runners to lock $800 floor, trail every $50 above
-  • New setups still entered but at 50% size to keep compounding
-  • Hard stop: $1,000 daily loss limit (50K DLL equivalent on 150K practice)
+Progressive daily profit protection:
+  • $500 hit  → floor locked at $500 (if P&L retreats to $500 → stop for day)
+  • $600 hit  → floor raised to $600, size reduced to 80%
+  • $750 hit  → floor raised to $750, size reduced to 70%
+  • $1000 hit → floor raised to $1000, size reduced to 50%
+  • $1500 hit → done for the day (max profit ceiling)
+  • Hard loss: $1000 max daily loss — locked immediately
 
 Position management:
-  • Entry: market order + stop loss bracket only (no TP bracket — managed manually)
+  • Entry: market order with stop+TP brackets (Auto OCO must be ON in TopstepX)
   • At +1R floating: partial close 60% of contracts (lock partial gain)
-  • Remaining 40% = runners with trailing stop
-  • Trail stop: move up every $50 of additional P&L above $800 floor
+  • Remaining 40% = runners with trailing stop (every $50 above first target)
 """
 
 import asyncio
@@ -36,16 +37,24 @@ UTC   = pytz.UTC
 
 # ─── Constants ──────────────────────────────────────────────────────────────
 
-DAILY_TARGET    = 600.0      # start trailing / protecting at this P&L
-DAILY_MAX_LOSS  = 1000.0     # 50K DLL equivalent
-TRAIL_INCREMENT = 50.0       # move stop up every $50 of additional gain above target
-PARTIAL_RATIO   = 0.60       # close this fraction at +1R (60% → lock gain, 40% runners)
+DAILY_MAX_LOSS   = 1000.0    # hard floor — locked for the day if hit
+DAILY_MAX_PROFIT = 1500.0    # hard ceiling — done for the day
+TRAIL_INCREMENT  = 50.0      # trail individual position stop every $50
+PARTIAL_RATIO    = 0.60      # close this fraction at +1R (60% → lock gain, 40% runners)
 MAX_DAILY_TRADES = 12        # ICT swing trades across all sessions
 
-# Scalp layer — runs every 30s alongside the ICT loop
-SCALP_TARGET_USD    = 50.0   # minimum scalp profit target in dollars
+# Progressive profit locks: (pnl_threshold, new_floor, size_factor)
+# Once P&L crosses threshold the floor is locked in — if P&L falls back to floor → stop.
+PROFIT_LOCKS = [
+    (500,   500,  1.00),
+    (600,   600,  0.80),
+    (750,   750,  0.70),
+    (1000, 1000,  0.50),
+    (1500, 1500,  0.00),   # max hit → stop trading
+]
+
+# Scalp layer — runs every 60s alongside the ICT loop
 MAX_SCALP_PER_DAY   = 4      # conservative cap until strategy is validated
-SCALP_HOLD_SECS     = 300    # max hold time before force-close (5 min)
 
 # Market closed 4:00–6:00 PM ET (CME daily break)
 MARKET_CLOSED_START = 16 * 60
@@ -135,8 +144,12 @@ _last_signal     : dict = {}
 _current_session_name: str = ""
 _last_check      : str = ""
 _trail_mode      : bool = False
-_trail_locked_pnl: float = 0.0   # P&L level we're protecting
-_trail_floor     : float = 0.0   # highest trail lock set so far
+_trail_locked_pnl: float = 0.0
+_trail_floor     : float = 0.0
+
+# Progressive profit protection state (reset each trading day)
+_daily_floor        : float = -DAILY_MAX_LOSS   # retreating to this level stops trading
+_daily_size_factor  : float = 1.0               # scales contracts down as profits lock in
 
 # Active trade tracking for position management
 _active_trade: dict = {}  # {symbol, entry_price, side, total_contracts, remaining_contracts,
@@ -162,16 +175,19 @@ def _log(msg: str, level: str = "info"):
 
 def get_state() -> dict:
     return {
-        "running":         _running,
-        "daily_pnl":       _daily_pnl,
-        "trades_today":    _trades_today,
-        "scalp_today":     _scalp_today,
-        "trail_mode":      _trail_mode,
-        "trail_floor":     _trail_floor,
-        "daily_target":    DAILY_TARGET,
-        "last_signal":     _last_signal,
-        "current_session": _current_session_name,
-        "last_check":      _last_check,
+        "running":          _running,
+        "daily_pnl":        _daily_pnl,
+        "trades_today":     _trades_today,
+        "scalp_today":      _scalp_today,
+        "trail_mode":       _trail_mode,
+        "trail_floor":      _trail_floor,
+        "daily_floor":      _daily_floor,
+        "daily_size_factor": _daily_size_factor,
+        "daily_max_profit": DAILY_MAX_PROFIT,
+        "daily_max_loss":   DAILY_MAX_LOSS,
+        "last_signal":      _last_signal,
+        "current_session":  _current_session_name,
+        "last_check":       _last_check,
         "active_trade":          _active_trade,
         "trade_log":             _trade_log[-30:],
         "bot_log":               _bot_log[-60:],
@@ -361,7 +377,8 @@ async def _scalp_loop():
             continue
 
         # Don't scalp if daily limits hit
-        if _daily_pnl <= -DAILY_MAX_LOSS:
+        halted, _ = _is_daily_halted()
+        if halted:
             continue
         if _scalp_today >= MAX_SCALP_PER_DAY:
             continue
@@ -421,6 +438,8 @@ async def _scalp_loop():
                     side=setup["side"],
                     size=setup["contracts"],
                     order_type=2,
+                    stop_loss_ticks=setup["stop_ticks"],
+                    take_profit_ticks=setup["tp_ticks"],
                 )
 
                 if result.get("success"):
@@ -486,13 +505,49 @@ def _news_clear(session_name: str) -> tuple[bool, str, int]:
 async def _sync_pnl():
     global _daily_pnl
     trades = await px.get_trade_history(days_back=2)
-    # 24h rolling window so cross-midnight futures sessions are captured correctly
-    cutoff = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M")
+    # Futures day starts at 6 PM ET — only count trades from this session's open
+    now_et = datetime.now(NY_TZ)
+    if now_et.hour >= 18:
+        session_open_et = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+    else:
+        yesterday_et = now_et - timedelta(days=1)
+        session_open_et = yesterday_et.replace(hour=18, minute=0, second=0, microsecond=0)
+    cutoff = session_open_et.astimezone(UTC).strftime("%Y-%m-%dT%H:%M")
     _daily_pnl = round(sum(
         (t.get("profitAndLoss") or 0) - (t.get("fees") or 0)
         for t in trades
         if t.get("creationTimestamp", "")[:16] >= cutoff
     ), 2)
+
+
+def _update_profit_locks():
+    """Advance daily floor and size factor as P&L crosses thresholds. Returns True if newly locked."""
+    global _daily_floor, _daily_size_factor
+    newly_locked = False
+    for threshold, new_floor, new_factor in PROFIT_LOCKS:
+        if _daily_pnl >= threshold and _daily_floor < new_floor:
+            _daily_floor       = new_floor
+            _daily_size_factor = new_factor
+            _log(f"PROFIT LOCK ${threshold:.0f} — floor ${new_floor:.0f} locked | size {new_factor:.0%}", "warning")
+            asyncio.create_task(tg.send(
+                f"🔒 <b>Profit Lock</b>  P&L <b>${_daily_pnl:.0f}</b>\n"
+                f"Floor locked at <b>${new_floor:.0f}</b> | Size → {new_factor:.0%}"
+            ))
+            newly_locked = True
+    return newly_locked
+
+
+def _is_daily_halted() -> tuple[bool, str]:
+    """Returns (halted, reason). Called before placing each trade."""
+    if _daily_pnl >= DAILY_MAX_PROFIT:
+        return True, f"Max profit ${DAILY_MAX_PROFIT:.0f} reached — done for the day 🎯"
+    if _daily_pnl <= -DAILY_MAX_LOSS:
+        return True, f"Max daily loss ${DAILY_MAX_LOSS:.0f} hit — locked 🛑"
+    if _daily_floor > 0 and _daily_pnl <= _daily_floor:
+        return True, f"P&L ${_daily_pnl:.0f} retreated to floor ${_daily_floor:.0f} — locking gains 🔒"
+    if _daily_size_factor == 0.0:
+        return True, "Daily max profit ceiling — done"
+    return False, ""
 
 
 # ─── Setup analysis ───────────────────────────────────────────────────────────
@@ -768,13 +823,15 @@ async def _loop():
 
             # Daily reset at midnight
             if now_et.hour == 0 and now_et.minute < 2:
-                _trades_today = 0
-                _scalp_today  = 0
+                _trades_today       = 0
+                _scalp_today        = 0
                 _session_trades.clear()
                 _last_scalp_time.clear()
-                _trail_mode   = False
-                _trail_floor  = 0.0
-                _eod_sent     = False
+                _trail_mode         = False
+                _trail_floor        = 0.0
+                _daily_floor        = -DAILY_MAX_LOSS
+                _daily_size_factor  = 1.0
+                _eod_sent           = False
                 _log("New trading day — all counters reset")
 
             # ── End-of-day summary at 3:50 PM ET ─────────────────────────
@@ -798,12 +855,15 @@ async def _loop():
                 await asyncio.sleep(120)
                 continue
 
-            # Hard daily loss limit
+            # Progressive profit locks + daily halt check
             await _sync_pnl()
-            if _daily_pnl <= -DAILY_MAX_LOSS:
-                _current_session_name = "HALTED — daily loss limit"
-                _log(f"Daily loss ${abs(_daily_pnl):.0f} hit ${DAILY_MAX_LOSS:.0f} limit — halted for day", "error")
-                asyncio.create_task(tg.alert_daily_halt(_daily_pnl, DAILY_MAX_LOSS))
+            _update_profit_locks()
+            halted, halt_reason = _is_daily_halted()
+            if halted:
+                _current_session_name = f"HALTED — {halt_reason}"
+                _log(halt_reason, "warning" if _daily_pnl > 0 else "error")
+                if _daily_pnl <= -DAILY_MAX_LOSS:
+                    asyncio.create_task(tg.alert_daily_halt(_daily_pnl, DAILY_MAX_LOSS))
                 await asyncio.sleep(600)
                 continue
 
@@ -887,13 +947,21 @@ async def _loop():
                         _log(f"{instrument}: 15m above SMA ({last_close_15m:.2f} > {sma_15m:.2f}) — skip short")
                         continue
 
+                # Apply daily size factor — reduce contracts as profits lock in
+                raw_cts = candidate["contracts"]
+                scaled  = max(1, round(raw_cts * _daily_size_factor))
+                if scaled != raw_cts:
+                    candidate["contracts"] = scaled
+                    config = _INSTRUMENT_CONFIG.get(instrument.upper(), _INSTRUMENT_CONFIG["MNQ"])
+                    candidate["usd_risk"] = round(candidate["stop_dist"] * config["dollars_per_point"] * scaled, 2)
+
                 candidate["htf_direction"] = htf_dir
                 setup = candidate
                 _log(
                     f"✓ {session['name']} | {instrument} {d.upper()} "
                     f"score={candidate['score']} ADX={candidate['adx']} RSI={candidate['rsi']} "
                     f"x{candidate['contracts']} risk=${candidate['usd_risk']:.0f} "
-                    f"HTF={htf_dir} {'[TRAIL MODE]' if _trail_mode else ''}"
+                    f"HTF={htf_dir} | floor=${_daily_floor:.0f} size={_daily_size_factor:.0%}"
                 )
                 break
 
@@ -909,11 +977,15 @@ async def _loop():
                 f"SL={setup['sl_price']:.2f}  2R_TP={setup['tp_price']:.2f}"
             )
 
+            sl_ticks = setup["stop_ticks"]
+            tp_ticks = sl_ticks * 2
             result = await px.place_order(
                 symbol=setup["instrument"],
                 side=setup["side"],
                 size=setup["contracts"],
                 order_type=2,
+                stop_loss_ticks=sl_ticks,
+                take_profit_ticks=tp_ticks,
             )
 
             if result.get("success"):
@@ -930,6 +1002,8 @@ async def _loop():
                             side=setup["side"],
                             size=setup["contracts"],
                             order_type=2,
+                            stop_loss_ticks=sl_ticks,
+                            take_profit_ticks=tp_ticks,
                             account_id=mirror_id,
                         )
                         if mr.get("success"):

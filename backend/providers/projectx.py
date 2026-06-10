@@ -375,9 +375,9 @@ async def place_order(
     if stop_price is not None:
         payload["stopPrice"] = stop_price
     if stop_loss_ticks is not None:
-        payload["stopLossBracket"] = {"tickDistance": stop_loss_ticks, "type": 4}
+        payload["stopLossBracket"] = {"ticks": stop_loss_ticks, "type": 4}
     if take_profit_ticks is not None:
-        payload["takeProfitBracket"] = {"tickDistance": take_profit_ticks, "type": 1}
+        payload["takeProfitBracket"] = {"ticks": take_profit_ticks, "type": 1}
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:

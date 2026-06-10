@@ -55,17 +55,21 @@ export default function Bot() {
     onSuccess: () => qc.invalidateQueries(['bot-status']),
   })
 
-  const running   = data?.running
-  const pnl       = data?.daily_pnl ?? 0
-  const session   = data?.current_session ?? '—'
-  const lastCheck = data?.last_check ?? '—'
-  const trades    = data?.trades_today ?? 0
-  const positions = data?.positions ?? []
-  const orders    = data?.open_orders ?? []
-  const quotes    = data?.quotes ?? {}
-  const botLog    = data?.bot_log ?? []
-  const tradeLog  = data?.trade_log ?? []
-  const lastSig   = data?.last_signal ?? {}
+  const running      = data?.running
+  const pnl          = data?.daily_pnl ?? 0
+  const session      = data?.current_session ?? '—'
+  const lastCheck    = data?.last_check ?? '—'
+  const trades       = data?.trades_today ?? 0
+  const positions    = data?.positions ?? []
+  const orders       = data?.open_orders ?? []
+  const quotes       = data?.quotes ?? {}
+  const botLog       = data?.bot_log ?? []
+  const tradeLog     = data?.trade_log ?? []
+  const lastSig      = data?.last_signal ?? {}
+  const dailyFloor   = data?.daily_floor ?? -1000
+  const sizeFactor   = data?.daily_size_factor ?? 1.0
+  const dailyMaxProfit = data?.daily_max_profit ?? 1500
+  const dailyMaxLoss   = data?.daily_max_loss ?? 1000
 
   const px = pxStatus.data
   const accounts = px?.accounts ?? []
@@ -114,7 +118,10 @@ export default function Bot() {
         <Stat label="Account P&L"   value={acctPnl !== null ? `$${acctPnl >= 0 ? '+' : ''}${acctPnl.toFixed(2)}` : '—'} color={acctColor} />
         <Stat label="ICT Trades"    value={trades} />
         <Stat label="Scalps Today"  value={data?.scalp_today ?? 0} />
-        <Stat label="Daily Target"  value={`$${data?.daily_target ?? 600}`} small />
+        <Stat label="Profit Floor"  value={dailyFloor > 0 ? `$${dailyFloor}` : 'None'} color={dailyFloor > 0 ? 'text-yellow-400' : 'text-gray-400'} small />
+        <Stat label="Size Factor"   value={`${Math.round(sizeFactor * 100)}%`} color={sizeFactor < 1 ? 'text-yellow-400' : 'text-green-400'} small />
+        <Stat label="Max Profit"    value={`$${dailyMaxProfit}`} small />
+        <Stat label="Max Loss"      value={`$${dailyMaxLoss}`} small />
         <Stat label="Last Check"    value={lastCheck} small />
       </div>
 
