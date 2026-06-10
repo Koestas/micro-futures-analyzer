@@ -468,12 +468,83 @@ async def _scalp_loop():
 
 # ─── News filter ─────────────────────────────────────────────────────────────
 
+# Phrases that always halt trading when found in a <20-min-old headline
+_HALT_PHRASES = [
+    "tariff", "trade war", "trade deal",
+    "rate cut", "rate hike",
+    "executive order",
+    "emergency meeting", "emergency rate",
+    "government shutdown", "debt ceiling", "debt default",
+    "sanctions",
+    "nuclear",
+]
+
+# Halt if an anchor word appears together with any of its trigger words
+_HALT_CONTEXT = {
+    "trump":       ["tariff", "trade", "ban", "order", "market", "announce", "tax", "sanction", "deal"],
+    "powell":      ["rate", "cut", "hike", "emergency", "surprise", "hawkish", "dovish"],
+    "white house": ["tariff", "trade", "order", "announce", "sanction", "ban"],
+    "fed ":        ["emergency", "unscheduled", "surprise", "intervene"],
+}
+
+_HEADLINE_CACHE: dict = {"data": [], "at": None}
+_HEADLINE_TTL   = 300   # seconds — refresh every 5 min
+
+
+def _breaking_news_halt() -> tuple[bool, str]:
+    """Check Yahoo Finance headlines for market-moving breaking news (< 20 min old).
+    Returns (halted, headline_snippet)."""
+    global _HEADLINE_CACHE
+    from datetime import timezone as _utc_tz
+    now_et  = datetime.now(NY_TZ)
+    now_utc = datetime.now(_utc_tz.utc)
+
+    # Refresh cache if stale
+    cache_age = (now_et - _HEADLINE_CACHE["at"]).total_seconds() if _HEADLINE_CACHE["at"] else 9999
+    if cache_age > _HEADLINE_TTL:
+        try:
+            from providers.yahoo import get_news
+            _HEADLINE_CACHE = {"data": get_news("QQQ"), "at": now_et}
+        except Exception:
+            pass
+
+    for item in _HEADLINE_CACHE["data"]:
+        ts = item.get("timestamp")
+        if not ts:
+            continue
+        try:
+            ts_clean = ts.replace("Z", "+00:00")
+            pub = datetime.fromisoformat(ts_clean)
+            if pub.tzinfo is None:
+                from datetime import timezone as _utc_tz2
+                pub = pub.replace(tzinfo=_utc_tz2.utc)
+            age_mins = (now_utc - pub).total_seconds() / 60
+            if age_mins > 20:   # only care about very recent headlines
+                continue
+        except Exception:
+            continue
+
+        title_lower = item["title"].lower()
+
+        # Exact phrase match
+        for phrase in _HALT_PHRASES:
+            if phrase in title_lower:
+                return True, item["title"][:70]
+
+        # Contextual match — anchor + at least one trigger
+        for anchor, triggers in _HALT_CONTEXT.items():
+            if anchor in title_lower and any(t in title_lower for t in triggers):
+                return True, item["title"][:70]
+
+    return False, ""
+
+
 def _news_clear(session_name: str) -> tuple[bool, str, int]:
-    """
-    Returns (clear, event_name, minutes_away).
-    Blocks trading if a High-impact USD event is within 30 minutes
-    or within 5 minutes after (let dust settle).
-    """
+    """Returns (clear, event_name, minutes_away).
+    Blocks if: scheduled High-impact USD event within 30 min window,
+    OR breaking news headline < 20 min old with market-moving keywords."""
+
+    # 1 — Scheduled economic calendar (ForexFactory)
     try:
         from providers.calendar import get_calendar
         cal = get_calendar()
@@ -494,10 +565,19 @@ def _news_clear(session_name: str) -> tuple[bool, str, int]:
             except Exception:
                 continue
             diff_mins = (ev_dt - now_et).total_seconds() / 60
-            if -5 <= diff_mins <= 30:   # 30 min before → 5 min after
+            if -5 <= diff_mins <= 30:
                 return False, ev.get("event", "High-impact event"), int(diff_mins)
     except Exception:
         pass
+
+    # 2 — Breaking news / unscheduled events (Trump, surprise Fed, tariff tweet, etc.)
+    try:
+        halted, headline = _breaking_news_halt()
+        if halted:
+            return False, f"Breaking news: {headline}", 0
+    except Exception:
+        pass
+
     return True, "", 0
 
 
