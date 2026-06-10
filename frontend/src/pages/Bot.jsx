@@ -84,10 +84,13 @@ export default function Bot() {
   const botLog       = data?.bot_log ?? []
   const tradeLog     = data?.trade_log ?? []
   const lastSig      = data?.last_signal ?? {}
-  const dailyFloor   = data?.daily_floor ?? -1000
-  const sizeFactor   = data?.daily_size_factor ?? 1.0
-  const dailyMaxProfit = data?.daily_max_profit ?? 1500
-  const dailyMaxLoss   = data?.daily_max_loss ?? 1000
+  const dailyFloor     = data?.daily_floor ?? -1000
+  const sizeFactor     = data?.daily_size_factor ?? 1.0
+  const dailyMaxProfit = data?.daily_max_profit ?? 400
+  const dailyMaxLoss   = data?.daily_max_loss ?? 800
+  const combinePnl     = data?.combine_pnl ?? 0
+  const combineTarget  = data?.combine_target ?? 2800
+  const combineProgress = Math.min(100, Math.max(0, (combinePnl / combineTarget) * 100))
 
   const px = pxStatus.data
   const accounts = px?.accounts ?? []
@@ -111,7 +114,7 @@ export default function Bot() {
         <div>
           <h1 className="text-xl font-bold text-white">Live Bot — ICT Auto-Trader</h1>
           <p className="text-xs text-gray-400 mt-0.5">
-            TopstepX practice account · Real market data · Real order execution
+            TopstepX 50K DLL Combine · $400/day cap · $800 daily stop · $2,800 payout lock
           </p>
         </div>
         <div className="flex gap-2">
@@ -132,6 +135,33 @@ export default function Bot() {
           <a href="/scalp-backtest" className="px-3 py-2 bg-terminal-card border border-terminal-border text-gray-400 hover:text-white text-sm rounded">
             Backtest Results
           </a>
+        </div>
+      </div>
+
+      {/* ── Combine progress bar ── */}
+      <div className="bg-terminal-card border border-terminal-border rounded p-3">
+        <div className="flex items-center justify-between mb-1.5">
+          <span className="text-xs font-semibold text-gray-300 uppercase tracking-wide">
+            Combine Progress — 50K DLL
+          </span>
+          <span className={`text-sm font-bold ${combinePnl >= combineTarget ? 'text-yellow-400 animate-pulse' : combinePnl > 0 ? 'text-green-400' : 'text-gray-400'}`}>
+            ${combinePnl.toFixed(0)} / ${combineTarget.toFixed(0)}
+            {combinePnl >= combineTarget && ' 🏆 TAKE THE PAYOUT'}
+          </span>
+        </div>
+        <div className="h-3 bg-gray-800 rounded-full overflow-hidden">
+          <div
+            className={`h-full rounded-full transition-all duration-500 ${
+              combineProgress >= 100 ? 'bg-yellow-400' :
+              combineProgress >= 75  ? 'bg-green-400' :
+              combineProgress >= 40  ? 'bg-blue-400'  : 'bg-gray-500'
+            }`}
+            style={{ width: `${combineProgress}%` }}
+          />
+        </div>
+        <div className="flex justify-between text-xs text-gray-500 mt-1">
+          <span>Daily cap: ${dailyMaxProfit} | Daily stop: -${dailyMaxLoss}</span>
+          <span>{combineProgress.toFixed(1)}% to payout</span>
         </div>
       </div>
 

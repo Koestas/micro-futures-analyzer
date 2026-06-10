@@ -616,12 +616,13 @@ _INSTRUMENT_CONFIG = {
     # stop_buffer: points beyond sweep wick/iFVG boundary
     # min_stop_pts: absolute floor — a tighter stop isn't executable on fast futures
     # max_contracts: hard cap for this account size (Lucid 25k Pro, $1k daily limit)
+    # max_contracts tuned for 50K DLL combine: $2k trailing drawdown, $1k daily loss limit
     "MNQ": {"multiplier": 1.0, "dollars_per_point": 2.0, "tick_size": 0.25,
-            "stop_buffer": 25.0, "min_stop_pts": 50.0, "max_contracts": 3, "name": "Micro NQ"},
+            "stop_buffer": 25.0, "min_stop_pts": 50.0, "max_contracts": 2, "name": "Micro NQ"},
     "MES": {"multiplier": 1.0, "dollars_per_point": 5.0, "tick_size": 0.25,
-            "stop_buffer": 15.0, "min_stop_pts": 30.0, "max_contracts": 2, "name": "Micro ES"},
+            "stop_buffer": 15.0, "min_stop_pts": 30.0, "max_contracts": 1, "name": "Micro ES"},
     "MGC": {"multiplier": 1.0, "dollars_per_point": 10.0, "tick_size": 0.1,
-            "stop_buffer": 6.0,  "min_stop_pts": 8.0,  "max_contracts": 2, "name": "Micro Gold"},
+            "stop_buffer": 6.0,  "min_stop_pts": 8.0,  "max_contracts": 1, "name": "Micro Gold"},
 }
 
 

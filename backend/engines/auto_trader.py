@@ -38,24 +38,33 @@ UTC   = pytz.UTC
 
 # ─── Constants ──────────────────────────────────────────────────────────────
 
-DAILY_MAX_LOSS   = 1000.0    # hard floor — locked for the day if hit
-DAILY_MAX_PROFIT = 1500.0    # hard ceiling — done for the day
-TRAIL_INCREMENT  = 50.0      # trail individual position stop every $50
-PARTIAL_RATIO    = 0.60      # close this fraction at +1R (60% → lock gain, 40% runners)
-MAX_DAILY_TRADES = 12        # ICT swing trades across all sessions
+# 50K DLL TopstepX combine rules:
+#   Daily loss limit: $1,000 (account locks until 6 PM ET)
+#   Trailing drawdown: $2,000 from peak equity
+#   Profit target: $3,000 net
+#   Min trading days: 5
+#   Consistency rule: no single day > 40% of total profit
+DAILY_MAX_LOSS      = 800.0    # $200 buffer — stop before TopstepX's $1k hard lock
+DAILY_MAX_PROFIT    = 400.0    # conservative daily cap — 8 days × $400 = $3,200 to pass
+COMBINE_PASS_HALT   = 2800.0   # cumulative P&L ceiling — STOP, force payout submission
+TRAIL_INCREMENT     = 50.0     # trail individual position stop every $50
+PARTIAL_RATIO       = 0.60     # close this fraction at +1R
+MAX_DAILY_TRADES    = 6        # tighter cap on combine — quality over quantity
 
-# Progressive profit locks: (pnl_threshold, new_floor, size_factor)
-# Once P&L crosses threshold the floor is locked in — if P&L falls back to floor → stop.
+# Progressive profit locks for 50K DLL combine:
+#   $150 = qualifying daily profit threshold (TopstepX minimum for a "passing day")
+#   $250 = reduce size and lock the floor
+#   $350 = one more trade max at minimum size
+#   $400 = done for the day, no exceptions
 PROFIT_LOCKS = [
-    (500,   500,  1.00),
-    (600,   600,  0.80),
-    (750,   750,  0.70),
-    (1000, 1000,  0.50),
-    (1500, 1500,  0.00),   # max hit → stop trading
+    (150,  150,  1.00),   # qualifying day locked in — protect it
+    (250,  250,  0.80),   # floor raised, size trimmed
+    (350,  350,  0.60),   # near daily cap — conservative runners only
+    (400,  400,  0.00),   # daily max — done, close app, go outside
 ]
 
-# Scalp layer — runs every 60s alongside the ICT loop
-MAX_SCALP_PER_DAY   = 4      # conservative cap until strategy is validated
+# Scalp layer — conservative on combine
+MAX_SCALP_PER_DAY   = 2      # fewer scalps on the real account
 
 # Market closed 4:00–6:00 PM ET (CME daily break)
 MARKET_CLOSED_START = 16 * 60
@@ -153,6 +162,10 @@ _trail_floor     : float = 0.0
 _daily_floor        : float = -DAILY_MAX_LOSS   # retreating to this level stops trading
 _daily_size_factor  : float = 1.0               # scales contracts down as profits lock in
 
+# Combine lifetime tracking — survives daily resets, triggers payout halt
+_total_combine_pnl  : float = 0.0   # cumulative P&L since bot started on this combine
+_combine_halt_alerted: bool = False  # only send the "TAKE PAYOUT" alert once
+
 # Active trade tracking for position management
 _active_trade: dict = {}  # {symbol, entry_price, side, total_contracts, remaining_contracts,
                            #  stop_price, stop_order_id, partial_done, direction, config}
@@ -187,6 +200,8 @@ def get_state() -> dict:
         "daily_size_factor": _daily_size_factor,
         "daily_max_profit": DAILY_MAX_PROFIT,
         "daily_max_loss":   DAILY_MAX_LOSS,
+        "combine_pnl":      round(_total_combine_pnl + _daily_pnl, 2),
+        "combine_target":   COMBINE_PASS_HALT,
         "last_signal":      _last_signal,
         "current_session":  _current_session_name,
         "last_check":       _last_check,
@@ -622,14 +637,22 @@ def _update_profit_locks():
 
 def _is_daily_halted() -> tuple[bool, str]:
     """Returns (halted, reason). Called before placing each trade."""
+    # ── COMBINE PAYOUT PROTECTION (highest priority) ─────────────────────────
+    # When cumulative P&L reaches the target, STOP. No more trading. Take the money.
+    if _total_combine_pnl >= COMBINE_PASS_HALT:
+        return True, (
+            f"🏆 COMBINE ESSENTIALLY PASSED — ${_total_combine_pnl:.0f} cumulative profit. "
+            f"STOP TRADING. Submit for payout NOW."
+        )
+    # ── Daily limits ─────────────────────────────────────────────────────────
     if _daily_pnl >= DAILY_MAX_PROFIT:
-        return True, f"Max profit ${DAILY_MAX_PROFIT:.0f} reached — done for the day 🎯"
+        return True, f"Daily cap ${DAILY_MAX_PROFIT:.0f} hit — done for the day 🎯"
     if _daily_pnl <= -DAILY_MAX_LOSS:
-        return True, f"Max daily loss ${DAILY_MAX_LOSS:.0f} hit — locked 🛑"
+        return True, f"Daily loss limit ${DAILY_MAX_LOSS:.0f} hit — locked 🛑"
     if _daily_floor > 0 and _daily_pnl <= _daily_floor:
         return True, f"P&L ${_daily_pnl:.0f} retreated to floor ${_daily_floor:.0f} — locking gains 🔒"
     if _daily_size_factor == 0.0:
-        return True, "Daily max profit ceiling — done"
+        return True, "Daily max hit — done"
     return False, ""
 
 
@@ -977,6 +1000,7 @@ async def _loop():
     global _running, _last_signal, _current_session_name, _last_check
     global _daily_pnl, _trades_today, _trail_mode, _trail_floor
     global _daily_floor, _daily_size_factor, _scalp_today, _eod_sent
+    global _total_combine_pnl, _combine_halt_alerted
 
     _log("Auto-trader started ✓  |  Target $800/day  |  22-hr coverage")
     asyncio.create_task(tg.alert_bot_started())
@@ -988,6 +1012,7 @@ async def _loop():
 
             # Daily reset at midnight
             if now_et.hour == 0 and now_et.minute < 2:
+                _total_combine_pnl += _daily_pnl   # carry today's P&L into lifetime total
                 _trades_today       = 0
                 _scalp_today        = 0
                 _session_trades.clear()
@@ -997,7 +1022,7 @@ async def _loop():
                 _daily_floor        = -DAILY_MAX_LOSS
                 _daily_size_factor  = 1.0
                 _eod_sent           = False
-                _log("New trading day — all counters reset")
+                _log(f"New trading day — combine total: ${_total_combine_pnl:.0f} / ${COMBINE_PASS_HALT:.0f}")
 
             # ── End-of-day summary at 3:50 PM ET ─────────────────────────
             if now_et.hour == 15 and now_et.minute == 50 and not _eod_sent:
@@ -1022,6 +1047,7 @@ async def _loop():
 
             # Progressive profit locks + daily halt check
             await _sync_pnl()
+            _total_combine_pnl_live = _total_combine_pnl + _daily_pnl
             _update_profit_locks()
             halted, halt_reason = _is_daily_halted()
             if halted:
@@ -1029,6 +1055,18 @@ async def _loop():
                 _log(halt_reason, "warning" if _daily_pnl > 0 else "error")
                 if _daily_pnl <= -DAILY_MAX_LOSS:
                     asyncio.create_task(tg.alert_daily_halt(_daily_pnl, DAILY_MAX_LOSS))
+                # Fire the payout alert once when combine target is hit
+                if _total_combine_pnl_live >= COMBINE_PASS_HALT and not _combine_halt_alerted:
+                    _combine_halt_alerted = True
+                    asyncio.create_task(tg.send(
+                        "🚨🏆🚨 <b>COMBINE PASSED — STOP TRADING RIGHT NOW</b> 🚨🏆🚨\n\n"
+                        f"Cumulative P&amp;L: <b>${_total_combine_pnl_live:.0f}</b>\n\n"
+                        "YOU HAVE ESSENTIALLY PASSED THE COMBINE.\n"
+                        "Do NOT place another trade.\n"
+                        "Log into TopstepX → submit for payout.\n\n"
+                        "The bot is locked. It will NOT trade until you restart it.\n"
+                        "This message exists because last time you didn't stop. Stop now."
+                    ))
                 await asyncio.sleep(600)
                 continue
 
